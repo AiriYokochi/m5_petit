@@ -107,6 +107,26 @@ void micStopIfNeeded() {
   Serial.println("[MIC] end");
 }
 
+void checkTouch() {
+  auto touch = CoreS3.Touch.getDetail();
+  if (touch.isPressed()) {
+    int x = touch.x;
+    int y = touch.y;
+    Serial.printf("Touch: %d, %d\n", x, y);
+    sendTouchEvent(x, y);
+  }
+}
+
+void sendTouchEvent(int x, int y) {
+  if (!wsClientConnected) return;
+  String json = "{";
+  json += "\"event\":\"touch\",";
+  json += "\"x\":" + String(x) + ",";
+  json += "\"y\":" + String(y);
+  json += "}";
+  webSocket.sendTXT(wsClientNum, json);
+}
+
 void handleGetVolume() {
   server.send(200, "text/plain", String(currentVolumePercent));
 }
@@ -594,6 +614,7 @@ void setup() {
 }
 
 void loop() {
+  CoreS3.update();
   server.handleClient();
   webSocket.loop();
 
@@ -610,6 +631,8 @@ void loop() {
       faceOverride = false;
     }
   }
+
+  checkTouch();
 
   // Mic streaming (WS接続時のみ。camera中はOFF)
   if (requestAudioEnd) {

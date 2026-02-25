@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html>
+<body>
+
+<button onclick="start()">Start</button>
+<br><br>
+<input type="file" id="wavFile" accept=".wav">
+<button onclick="sendWav()">Send WAV to CoreS3</button>
+
+<script>
+let ws;
+let audioCtx;
+let processor;
+
+let ringBuffer = new Float32Array(48000);
+let writePos = 0;
+let readPos = 0;
+
+function start() {
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+    sampleRate: 16000
+  });
+
+  processor = audioCtx.createScriptProcessor(1024, 1, 1);
+
+  processor.onaudioprocess = function(e) {
+
+    const output = e.outputBuffer.getChannelData(0);
+
+    for (let i = 0; i < output.length; i++) {
+
+      if (readPos !== writePos) {
+        output[i] = ringBuffer[readPos];
+        readPos = (readPos + 1) % ringBuffer.length;
+      } else {
+        output[i] = 0;
+      }
+    }
+  };
+
+  processor.connect(audioCtx.destination);
+
+  ws = new WebSocket("ws://<IPアドレス>:8080");
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    console.log("WebSocket connected");
+  };
+
+  ws.onmessage = (event) => {
+
+    if (event.data instanceof ArrayBuffer) {
+      const view = new DataView(event.data);
+      const length = event.data.byteLength / 2;
+      for (let i = 0; i < length; i++) {
+        const sample = view.getInt16(i * 2, true) / 32768.0;
+        ringBuffer[writePos] = sample;
+        writePos = (writePos + 1) % ringBuffer.length;
+        if (writePos === readPos) {
+          readPos = (readPos + 1024) % ringBuffer.length;
+        }
+      }
+      return;
+    }
+
+    if (typeof event.data === "string") {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.event === "touch") {
+          console.log("Touched at:", data.x, data.y);
+        }
+      } catch (e) {
+        console.log("Non-JSON text:", event.data);
+      }
+    }
+  };
+}
+
+function sendWav() {
+
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    alert("WebSocket未接続");
+    return;
+  }
+
+  const fileInput = document.getElementById("wavFile");
+  const file = fileInput.files[0];
+
+  if (!file) {
+    alert("WAVを選択してくださいね");
+    return;
+  }
+
+  const reader = new FileReader();
+
+  reader.onload = function(e) {
+
+    const arrayBuffer = e.target.result;
+
+    // WAVヘッダ除去（44バイト）
+    const pcmData = arrayBuffer.slice(44);
+
+    const chunkSize = 2048;
+    let offset = 0;
+
+    function sendChunk() {
+
+      if (offset >= pcmData.byteLength) {
+        ws.send("END");
+        console.log("PCM send complete");
+        return;
+      }
+
+      const slice = pcmData.slice(offset, offset + chunkSize);
+      ws.send(slice);
+
+      offset += chunkSize;
+
+      setTimeout(sendChunk, 15);
+    }
+
+    sendChunk();
+  };
+
+  reader.readAsArrayBuffer(file);
+}
+
+</script>
+
+</body>
+</html>
