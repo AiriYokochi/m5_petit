@@ -102,6 +102,7 @@ WAV形式は
 
 ### 📡 HTTP API
 
+helpに最新のAPIが書いてあります。
 
 ブラウザでアクセス
 - `http://<IPアドレス>/help`
@@ -130,7 +131,11 @@ WAV形式は
   - スリープモード、3回タッチか明るい場所でおきる
 - `http://<IPアドレス>/wake`
   - 起きる
-  
+- `http://<IPアドレス>/icon_list`
+  - アイコンリスト
+- `http://<IPアドレス>/icon_play?name=love`  
+  - アイコン表示
+
 ### 🖥 PC側テストHTML
 `ws://<IPアドレス>:8080`
 

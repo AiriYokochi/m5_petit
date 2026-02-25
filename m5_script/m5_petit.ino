@@ -113,6 +113,11 @@ enum FaceMode {
 
 FaceMode currentFaceMode = FACE_DRAW;
 
+// ===== Icon animation =====
+String currentIcon = "";
+unsigned long iconStartTime = 0;
+const unsigned long ICON_DURATION = 3000;
+
 // ===================== Helpers =====================
 void drawWifiStatus();
 void drawIPIfNeeded();
@@ -416,6 +421,44 @@ void drawFace(int eyeOffsetX, int eyeOffsetY, int mouthOpen) {
     mouthY + 45,
     faceColor
   );
+  if (currentIcon != "") {
+
+    unsigned long dt = millis() - iconStartTime;
+
+    if (dt > ICON_DURATION) {
+      currentIcon = "";
+    } else {
+
+      float t = millis() * 0.005;
+
+      if (currentIcon == "love") {
+        // 右上ハート
+        int hx = 260;
+        int hy = 40 + sin(t) * 5;
+
+        faceSprite.fillCircle(hx - 6, hy, 8, TFT_RED);
+        faceSprite.fillCircle(hx + 6, hy, 8, TFT_RED);
+        faceSprite.fillTriangle(
+          hx - 14, hy,
+          hx + 14, hy,
+          hx, hy + 20,
+          TFT_RED
+        );
+      }
+
+      if (currentIcon == "cry") {
+        int leftX  = cx - 85 + eyePxX;
+        int rightX = cx + 85 + eyePxX;
+        int baseY  = cy - 5 + eyePxY;
+
+        int dropOffset = abs(sin(t)) * 10;
+
+        faceSprite.fillEllipse(leftX,  baseY + dropOffset, 5, 10, TFT_BLUE);
+        faceSprite.fillEllipse(rightX, baseY + dropOffset, 5, 10, TFT_BLUE);
+      }
+    }
+  }
+
 
   drawWifiStatusSprite();
   drawIPIfNeededSprite();
@@ -893,9 +936,38 @@ void handleHelp() {
   json += "{ \"path\":\"/getvolume\", \"method\":\"GET\", \"description\":\"音量取得\" }";
   json += "{ \"path\":\"/sleep\", \"method\":\"GET\", \"description\":\"スリープモード\" }";
   json += "{ \"path\":\"/wake\", \"method\":\"GET\", \"description\":\"ウェイクモード\" }";
+  json += "{ \"path\":\"/icon_list\", \"method\":\"GET\", \"description\":\"アイコンのリスト取得\" }";
+  json += "{ \"path\":\"/icon_play\", \"method\":\"GET\", \"description\":\"アイコン表示\" }";
   json += "]";
   json += "}";
   server.send(200, "application/json", json);
+}
+
+void handleIconList(){
+  String json = "{";
+  json += "\"icons\":[\"love\",\"cry\"]";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleIconPlay(){
+  if (!server.hasArg("name")) {
+    server.send(400, "text/plain", "missing name");
+    return;
+  }
+
+  String name = server.arg("name");
+
+  if (name != "love" && name != "cry") {
+    server.send(400, "text/plain", "unknown icon");
+    return;
+  }
+
+  currentIcon = name;
+  iconStartTime = millis();
+
+  server.send(200, "text/plain", "ok");
 }
 
 void handleBlink() {
@@ -1006,6 +1078,8 @@ void setup() {
   server.on("/se_play", HTTP_GET, handleSePlay);
   server.on("/setvolume", HTTP_GET, handleSetVolume);
   server.on("/getvolume", HTTP_GET, handleGetVolume);
+  server.on("/icon_list", HTTP_GET, handleIconList);
+  server.on("/icon_play", HTTP_GET, handleIconPlay);
   server.on("/sleep", HTTP_GET, []() {
     server.send(200, "text/plain", "sleeping");
     delay(100);
