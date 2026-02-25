@@ -101,6 +101,11 @@ bool winkLeft = false;
 bool winkRight = false;
 unsigned long winkEndTime = 0;
 
+bool isSleeping = false;
+int touchCount = 0;
+unsigned long lastTouchTime = 0;
+unsigned long sleepStartTime = 0;
+
 enum FaceMode {
   FACE_JPEG,
   FACE_DRAW
@@ -416,6 +421,60 @@ void drawFace(int eyeOffsetX, int eyeOffsetY, int mouthOpen) {
   drawIPIfNeededSprite();
 
   faceSprite.pushSprite(0,0);
+}
+void playSleepAnimation() {
+  for (int i = 0; i < 20; i++) {
+    drawFace(0, i * 2, 0);
+    delay(15);
+  }
+  for (int i = 0; i < 30; i++) {
+    blinking = true;
+    blinkStartTime = millis();
+    delay(10);
+  }
+  delay(200);
+}
+
+void enterSleepMode() {
+
+  Serial.println("Going to sleep...");
+  playSleepAnimation();
+  playWavFromSD("/wav/zzz.wav");
+  isSleeping = true;
+  touchCount = 0;
+  sleepStartTime = millis();
+
+  webSocket.disconnect();
+  micStopIfNeeded();
+  if ( speakerActive){
+    CoreS3.Speaker.end();
+    speakerActive = false;
+  }
+
+  File f = SD.open("/face/sleep.jpg");
+  if (f) {
+    size_t size = f.size();
+    uint8_t* buf = (uint8_t*)malloc(size);
+    if (buf) {
+      f.read(buf, size);
+      CoreS3.Display.drawJpg(buf, size, 0, 0);
+      free(buf);
+    }
+    f.close();
+  }
+  CoreS3.Display.setBrightness(15);
+  Serial.println("Sleep mode ON");
+}
+
+void wakeUp() {
+  Serial.println("Waking up...");
+  CoreS3.Display.setBrightness(200);
+  playWavFromSD("/wav/wakeup.wav");
+  faceSprite.fillSprite(TFT_WHITE);
+  faceSprite.pushSprite(0, 0);
+  isSleeping = false;
+  currentFaceMode = FACE_DRAW;
+  Serial.println("Awake!");
 }
 
 void showFaceFile(const String& filename) {
@@ -832,6 +891,8 @@ void handleHelp() {
   json += "{ \"path\":\"/se_play?name=xxx.wav\", \"method\":\"GET\", \"description\":\"音声再生\" },";
   json += "{ \"path\":\"/setvolume?value=0~100\", \"method\":\"GET\", \"description\":\"音量変更\" },";
   json += "{ \"path\":\"/getvolume\", \"method\":\"GET\", \"description\":\"音量取得\" }";
+  json += "{ \"path\":\"/sleep\", \"method\":\"GET\", \"description\":\"スリープモード\" }";
+  json += "{ \"path\":\"/wake\", \"method\":\"GET\", \"description\":\"ウェイクモード\" }";
   json += "]";
   json += "}";
   server.send(200, "application/json", json);
@@ -945,6 +1006,19 @@ void setup() {
   server.on("/se_play", HTTP_GET, handleSePlay);
   server.on("/setvolume", HTTP_GET, handleSetVolume);
   server.on("/getvolume", HTTP_GET, handleGetVolume);
+  server.on("/sleep", HTTP_GET, []() {
+    server.send(200, "text/plain", "sleeping");
+    delay(100);
+    enterSleepMode();
+  });
+  server.on("/wake", HTTP_GET, []() {
+    server.send(200, "text/plain", "waking");
+    delay(50);
+    if (isSleeping) {
+      wakeUp();
+    }
+  });
+
   server.begin();
 
   // WebSocket
@@ -965,6 +1039,27 @@ void loop() {
   webSocket.loop();
 
   updateWifiState();
+
+  if (isSleeping) {
+    auto touch = CoreS3.Touch.getDetail();
+    if (touch.isPressed()) {
+      if (millis() - lastTouchTime < 1000) {
+        touchCount++;
+      } else {
+        touchCount = 1;
+      }
+      lastTouchTime = millis();
+      if (touchCount >= 3) {
+        wakeUp();
+      }
+    }
+    uint16_t ambient = CoreS3.Ltr553.getAlsValue();
+    if (ambient > 2500) {
+      wakeUp();
+    }
+    return;
+  }
+
 
   unsigned long now = millis();
   if (!blinking && now >= nextBlinkTime) {
