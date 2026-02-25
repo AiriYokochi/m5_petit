@@ -25,6 +25,7 @@ String ipString;
 unsigned long lastWifiCheck = 0;
 unsigned long lastReconnectTry = 0;
 bool wifiConnected = false;
+static unsigned long lastSensorSend = 0;
 
 // ===================== Face slideshow =====================
 unsigned long lastFaceChange = 0;
@@ -71,10 +72,36 @@ bool speakerActive = false;
 static unsigned long lastAudioDataTime = 0;
 volatile unsigned long micStartDelayTime = 0;
 
+Ltr5xx_Init_Basic_Para device_init_base_para = LTR5XX_BASE_PARA_CONFIG_DEFAULT;
+
 // ===================== Helpers =====================
 void drawWifiStatus();
 void drawIPIfNeeded();
 void showNextFaceImage();
+
+void initSensors() {
+
+  // ===== IMU =====
+  if (M5.Imu.begin()) {
+    Serial.println("IMU OK");
+  } else {
+    Serial.println("IMU NG");
+  }
+
+  // ===== LTR553 設定 =====
+  device_init_base_para.ps_led_pulse_freq   = LTR5XX_LED_PULSE_FREQ_40KHZ;
+  device_init_base_para.ps_measurement_rate = LTR5XX_PS_MEASUREMENT_RATE_50MS;
+  device_init_base_para.als_gain            = LTR5XX_ALS_GAIN_48X;
+
+  if (!CoreS3.Ltr553.begin(&device_init_base_para)) {
+    Serial.println("LTR553 NG");
+  } else {
+    Serial.println("LTR553 OK");
+
+    CoreS3.Ltr553.setPsMode(LTR5XX_PS_ACTIVE_MODE);
+    CoreS3.Ltr553.setAlsMode(LTR5XX_ALS_ACTIVE_MODE);
+  }
+}
 
 void micStartIfNeeded() {
 
@@ -531,12 +558,47 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
     }
 }
 
+void sendSensorPacket() {
+
+  if (!wsClientConnected) return;
+
+  // ===== IMU更新 =====
+  if (!M5.Imu.update()) return;
+
+  auto data = M5.Imu.getImuData();
+
+  // ===== LTR553 =====
+  uint16_t proximity = CoreS3.Ltr553.getPsValue();
+  uint16_t ambient   = CoreS3.Ltr553.getAlsValue();
+
+  // ===== Power =====
+  float battery = CoreS3.Power.getBatteryLevel();
+  float voltage = CoreS3.Power.getBatteryVoltage();
+
+  // ===== JSON生成 =====
+  String json = "{";
+  json += "\"event\":\"sensors\",";
+  json += "\"ambient\":" + String(ambient) + ",";
+  json += "\"proximity\":" + String(proximity) + ",";
+  json += "\"ax\":" + String(data.accel.x,2) + ",";
+  json += "\"ay\":" + String(data.accel.y,2) + ",";
+  json += "\"az\":" + String(data.accel.z,2) + ",";
+  json += "\"gx\":" + String(data.gyro.x,2) + ",";
+  json += "\"gy\":" + String(data.gyro.y,2) + ",";
+  json += "\"gz\":" + String(data.gyro.z,2) + ",";
+  json += "\"battery\":" + String(battery,1);
+  json += "}";
+
+  webSocket.sendTXT(wsClientNum, json);
+}
+
+
 // ===================== Setup / Loop =====================
 void setup() {
   auto cfg = M5.config();
   CoreS3.begin(cfg);
   Serial.begin(115200);
-
+  initSensors();
 
 
   // Display
@@ -619,6 +681,12 @@ void loop() {
   webSocket.loop();
 
   updateWifiState();
+
+  if (millis() - lastSensorSend > 250) {
+    lastSensorSend = millis();
+    sendSensorPacket();
+  }
+
 
   // Face slideshow (override中は止める)
   if (!faceOverride) {

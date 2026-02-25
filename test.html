@@ -70,6 +70,11 @@ function start() {
         if (data.event === "touch") {
           console.log("Touched at:", data.x, data.y);
         }
+        if (data.event === "sensors") {
+          console.log("Ambient:", data.ambient,
+                      "Proximity:", data.proximity,
+                      "Battery:", data.battery);
+        }
       } catch (e) {
         console.log("Non-JSON text:", event.data);
       }
