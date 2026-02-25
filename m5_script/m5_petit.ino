@@ -59,6 +59,8 @@ volatile bool requestMicStart = false;
 volatile bool requestMicStop = false;
 volatile bool requestAudioEnd = false;
 
+uint8_t currentVolumePercent = 80;  // 0-100
+uint8_t currentVolumeRaw = 204;
 
 // ===== リングバッファ =====
 #define AUDIO_BUFFER_SIZE 8192
@@ -105,13 +107,17 @@ void micStopIfNeeded() {
   Serial.println("[MIC] end");
 }
 
+void handleGetVolume() {
+  server.send(200, "text/plain", String(currentVolumePercent));
+}
+
 void playWavFromSD(const char* path) {
 
   // MICを必ず止める
   micStopIfNeeded();
 
   CoreS3.Speaker.begin();
-  CoreS3.Speaker.setVolume(255);
+  CoreS3.Speaker.setVolume(currentVolumeRaw);
 
   File wav = SD.open(path);
   if (!wav) {
@@ -156,6 +162,33 @@ void playWavFromSD(const char* path) {
     micStartIfNeeded();
   }
 }
+
+void handleSetVolume() {
+
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "missing value");
+    return;
+  }
+
+  int v = server.arg("value").toInt();
+
+  if (v < 0) v = 0;
+  if (v > 100) v = 100;
+
+  currentVolumePercent = v;
+
+  // 0-100 → 0-255へ変換
+  currentVolumeRaw = map(currentVolumePercent, 0, 100, 0, 255);
+
+  CoreS3.Speaker.setVolume(currentVolumeRaw);
+
+  Serial.printf("Volume set: %d%% (%d raw)\n",
+                currentVolumePercent,
+                currentVolumeRaw);
+
+  server.send(200, "text/plain", "ok");
+}
+
 
 void showFaceFile(const String& filename) {
   String path = "/face/" + filename;
@@ -543,6 +576,8 @@ void setup() {
   server.on("/se_list", HTTP_GET, handleSeList);
   server.on("/face_play", HTTP_GET, handleFacePlay);
   server.on("/se_play", HTTP_GET, handleSePlay);
+  server.on("/setvolume", HTTP_GET, handleSetVolume);
+  server.on("/getvolume", HTTP_GET, handleGetVolume);
   server.begin();
 
   // WebSocket
@@ -617,7 +652,7 @@ if (audioReadIndex != audioWriteIndex) {
     if (!speakerActive) {
         micStopIfNeeded();
         CoreS3.Speaker.begin();
-        CoreS3.Speaker.setVolume(255);
+        CoreS3.Speaker.setVolume(currentVolumeRaw);
         speakerActive = true;
     }
     static int16_t chunk[1024];

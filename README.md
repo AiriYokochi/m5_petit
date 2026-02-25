@@ -114,6 +114,10 @@ WAV形式は
   - SEを鳴らす
 - `http://<IPアドレス>/face_play?name=XXXX.jpg`
   - 顔画像を5秒間表示させる
+- `http://<IPアドレス>/setvolume?value=XX`
+  - 0~100で音量をセットする
+- `http://<IPアドレス>/getvolume`
+  - 現在音量を取得
   
 ### 🖥 PC側テストHTML
 `ws://<IPアドレス>:8080`
@@ -250,9 +254,11 @@ function sendWav() {
 ---
 
 ### 🔊 WAVファイルをCoreS3に送信して再生する
+
 PCブラウザからWAVファイルを選択し、
 WebSocket経由でCoreS3に送信してスピーカー再生できます。
 ![alt text](img/image2.png)
+
 ---
 
 ### ⚠️ 重要注意事項
