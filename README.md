@@ -257,6 +257,7 @@ function sendWav() {
 
 PCブラウザからWAVファイルを選択し、
 WebSocket経由でCoreS3に送信してスピーカー再生できます。
+終わりにENDとテキストを送る必要があります。
 ![alt text](img/image2.png)
 
 ---
@@ -272,6 +273,24 @@ M5CoreS3のタッチパネルが押されたときに、
   "event": "touch",
   "x": 120,
   "y": 200
+}
+```
+
+### センサー送信
+250ms周期で送信
+
+```json
+{
+  "event": "sensors",
+  "ambient": 342,
+  "proximity": 120,
+  "ax": 0.01,
+  "ay": -0.98,
+  "az": 0.12,
+  "gx": 0.00,
+  "gy": 0.02,
+  "gz": -0.01,
+  "battery": 83.4
 }
 ```
 
