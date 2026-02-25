@@ -104,6 +104,8 @@ WAV形式は
 
 
 ブラウザでアクセス
+- `http://<IPアドレス>/help`
+  - ヘルプ
 - `http://<IPアドレス>/snapshot`
   - jpgがみれる
 - `http://<IPアドレス>/se_list`
@@ -118,6 +120,12 @@ WAV形式は
   - 0~100で音量をセットする
 - `http://<IPアドレス>/getvolume`
   - 現在音量を取得
+- `http://<IPアドレス>/face_draw_mode`
+   - 自由に顔が動くモード
+- `http://<IPアドレス>/face_play_mode`
+  - スライドショーモード
+- `http://<IPアドレス>/set_face_draw?eyeX=-100~100&eyeY=-100~100`
+  - 視線を移動させる
   
 ### 🖥 PC側テストHTML
 `ws://<IPアドレス>:8080`

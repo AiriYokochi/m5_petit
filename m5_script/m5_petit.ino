@@ -62,7 +62,7 @@ volatile bool requestAudioEnd = false;
 
 uint8_t currentVolumePercent = 80;  // 0-100
 uint8_t currentVolumeRaw = 204;
-
+static unsigned long lastFaceDraw = 0;
 // ===== リングバッファ =====
 #define AUDIO_BUFFER_SIZE 8192
 int16_t audioBuffer[AUDIO_BUFFER_SIZE];
@@ -73,6 +73,40 @@ static unsigned long lastAudioDataTime = 0;
 volatile unsigned long micStartDelayTime = 0;
 
 Ltr5xx_Init_Basic_Para device_init_base_para = LTR5XX_BASE_PARA_CONFIG_DEFAULT;
+
+LGFX_Sprite faceSprite(&CoreS3.Display);
+volatile bool faceDirty = true; 
+
+
+// ===== Face draw params =====
+volatile int eyeX = 0;        // -100 ~ +100
+volatile int eyeY = 0;
+volatile int mouthValue = 0;  // 0 ~ 100
+
+// ===== 視線制御 =====
+float eyeCurrentX = 0;
+float eyeCurrentY = 0;
+float eyeTargetX = 0;
+float eyeTargetY = 0;
+unsigned long eyeReturnTime = 0;
+bool eyeAutoReturn = false;
+
+// ===== まばたき制御 =====
+bool blinking = false;
+unsigned long blinkStartTime = 0;
+unsigned long nextBlinkTime = 0;
+float mouthCurrent = 0;
+const unsigned long BLINK_DURATION = 250;
+bool winkLeft = false;
+bool winkRight = false;
+unsigned long winkEndTime = 0;
+
+enum FaceMode {
+  FACE_JPEG,
+  FACE_DRAW
+};
+
+FaceMode currentFaceMode = FACE_DRAW;
 
 // ===================== Helpers =====================
 void drawWifiStatus();
@@ -235,7 +269,154 @@ void handleSetVolume() {
 
   server.send(200, "text/plain", "ok");
 }
+void drawRotatedEllipseSprite(int cx, int cy, int rx, int ry, float angleDeg, uint16_t color) {
 
+  float angle = angleDeg * DEG_TO_RAD;
+  float cosA = cos(angle);
+  float sinA = sin(angle);
+
+  for (int x = -rx; x <= rx; x++) {
+    for (int y = -ry; y <= ry; y++) {
+
+      if ((x*x)/(float)(rx*rx) + (y*y)/(float)(ry*ry) <= 1.0) {
+
+        int xr = (int)(x * cosA - y * sinA);
+        int yr = (int)(x * sinA + y * cosA);
+
+        faceSprite.drawPixel(cx + xr, cy + yr, color);
+      }
+    }
+  }
+}
+void drawIPIfNeededSprite() {
+
+  if (!showIP) return;
+
+  if (millis() - bootTime < 30000) {
+
+    faceSprite.fillRect(0, 220, 320, 20, TFT_WHITE);
+    faceSprite.setTextColor(TFT_GREEN, TFT_WHITE);
+    faceSprite.setCursor(200, 220);
+    faceSprite.print(ipString);
+  }
+}
+
+void drawWifiStatusSprite() {
+  const int x = 200;
+  const int y = 0;
+  faceSprite.fillRect(x, y, 120, 18, TFT_WHITE);
+  if (!wifiConnected) {
+    faceSprite.setTextColor(TFT_RED, TFT_WHITE);
+    faceSprite.setCursor(x, y);
+    faceSprite.print("WiFi ERROR");
+  }
+}
+
+void drawFace(int eyeOffsetX, int eyeOffsetY, int mouthOpen) {
+
+  float t = millis() * 0.002;
+
+  int idleOffsetX = sin(t) * 5;
+  int idleOffsetY = cos(t * 0.7) * 4;
+
+  int cx = 160 + idleOffsetX;
+  int cy = 120 + idleOffsetY;
+
+  int ex = constrain(eyeOffsetX, -100, 100);
+  int ey = constrain(eyeOffsetY, -100, 100);
+
+  int eyePxX = ex * 30 / 100;
+  int eyePxY = ey * 20 / 100;
+
+  int mo = constrain(mouthOpen, 0, 100);
+  int mouthSize = 20 + mo * 20 / 100;
+
+  uint16_t faceColor = TFT_LIGHTGREY;
+
+  faceSprite.fillSprite(TFT_WHITE);
+
+  // ===== 鼻（目に合わせて移動）=====
+  faceSprite.fillEllipse(
+    cx + eyePxX * 0.8,
+    cy + 1 + eyePxY * 0.8,
+    14,
+    6,
+    faceColor
+  );
+
+  // ===== 目 =====
+  int leftEyeHeight = 32;
+  int rightEyeHeight = 32;
+
+  // 通常瞬き
+  if (blinking) {
+    unsigned long dt = millis() - blinkStartTime;
+    float p = (float)dt / (float)BLINK_DURATION;
+    float tri = (p < 0.5f) ? (p * 2.0f) : ((1.0f - p) * 2.0f);
+    int h = (int)(32 - tri * 29);
+    if (h < 3) h = 3;
+    leftEyeHeight = h;
+    rightEyeHeight = h;
+  }
+
+  // ウインク優先
+  if (winkLeft) leftEyeHeight = 3;
+  if (winkRight) rightEyeHeight = 3;
+
+  drawRotatedEllipseSprite(
+    cx - 85 + eyePxX,
+    cy - 30 + eyePxY,
+    22,
+    leftEyeHeight,
+    +20,
+    faceColor
+  );
+
+  drawRotatedEllipseSprite(
+    cx + 85 + eyePxX,
+    cy - 30 + eyePxY,
+    22,
+    rightEyeHeight,
+    -20,
+    faceColor
+  );
+
+  // ===== ハート口（目と一緒に動く）=====
+  int mouthY = cy + 45 + eyePxY;
+
+  drawRotatedEllipseSprite(
+    cx - 18 + eyePxX,
+    mouthY,
+    mouthSize,
+    mouthSize,
+    -10,
+    faceColor
+  );
+
+  drawRotatedEllipseSprite(
+    cx + 18 + eyePxX,
+    mouthY,
+    mouthSize,
+    mouthSize,
+    +10,
+    faceColor
+  );
+
+  faceSprite.fillTriangle(
+    cx - 30 + eyePxX,
+    mouthY + 10,
+    cx + 30 + eyePxX,
+    mouthY + 10,
+    cx + eyePxX,
+    mouthY + 45,
+    faceColor
+  );
+
+  drawWifiStatusSprite();
+  drawIPIfNeededSprite();
+
+  faceSprite.pushSprite(0,0);
+}
 
 void showFaceFile(const String& filename) {
   String path = "/face/" + filename;
@@ -561,21 +742,15 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
 void sendSensorPacket() {
 
   if (!wsClientConnected) return;
-
-  // ===== IMU更新 =====
   if (!M5.Imu.update()) return;
-
   auto data = M5.Imu.getImuData();
-
   // ===== LTR553 =====
   uint16_t proximity = CoreS3.Ltr553.getPsValue();
   uint16_t ambient   = CoreS3.Ltr553.getAlsValue();
-
   // ===== Power =====
   float battery = CoreS3.Power.getBatteryLevel();
   float voltage = CoreS3.Power.getBatteryVoltage();
-
-  // ===== JSON生成 =====
+  // ===== JSON =====
   String json = "{";
   json += "\"event\":\"sensors\",";
   json += "\"ambient\":" + String(ambient) + ",";
@@ -592,14 +767,119 @@ void sendSensorPacket() {
   webSocket.sendTXT(wsClientNum, json);
 }
 
+static int clampInt(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+void handleFace() {
+
+  if (server.hasArg("eyeX")) {
+    eyeTargetX = clampInt(server.arg("eyeX").toInt(), -100, 100);
+  }
+
+  if (server.hasArg("eyeY")) {
+    eyeTargetY = clampInt(server.arg("eyeY").toInt(), -100, 100);
+  }
+
+  if (server.hasArg("mouth")) {
+    mouthValue = clampInt(server.arg("mouth").toInt(), 0, 100);
+  }
+
+  // 5秒後に正面へ戻す
+  eyeReturnTime = millis() + 5000;
+  eyeAutoReturn = true;
+
+  currentFaceMode = FACE_DRAW;
+
+  String res = "{";
+  res += "\"ok\":true,";
+  res += "\"targetX\":" + String(eyeTargetX) + ",";
+  res += "\"targetY\":" + String(eyeTargetY);
+  res += "}";
+
+  server.send(200, "application/json", res);
+}
+
+void enableDrawFaceMode() {
+  currentFaceMode = FACE_DRAW;
+  CoreS3.Display.fillScreen(TFT_WHITE);
+  drawFace(eyeX, eyeY, mouthValue);;
+  lastFaceDraw = 0;
+  server.send(200, "text/plain", "ok");
+  faceDirty = true;
+}
+
+void enablePlayFaceMode() {
+  currentFaceMode = FACE_JPEG;
+  CoreS3.Display.fillScreen(TFT_WHITE);
+  lastFaceChange = 0;   // ← すぐ次画像へ
+  server.send(200, "text/plain", "ok");
+}
+void handleHelp() {
+  String json = "{";
+  json += "\"endpoints\":[";
+  json += "{ \"path\":\"/help\", \"method\":\"GET\", \"description\":\"API一覧\" },";
+  json += "{ \"path\":\"/snapshot\", \"method\":\"GET\", \"description\":\"カメラ撮影\" },";
+  json += "{ \"path\":\"/face_list\", \"method\":\"GET\", \"description\":\"顔画像一覧\" },";
+  json += "{ \"path\":\"/face_play?name=xxx.jpg\", \"method\":\"GET\", \"description\":\"顔画像表示\" },";
+  json += "{ \"path\":\"/face_draw_mode\", \"method\":\"GET\", \"description\":\"描画モードへ切替\" },";
+  json += "{ \"path\":\"/face_play_mode\", \"method\":\"GET\", \"description\":\"スライドショーモード\" },";
+  json += "{ \"path\":\"/set_face_draw?eyeX=-100~100&eyeY=-100~100\", \"method\":\"GET\", \"description\":\"視線移動（5秒後戻る）\" },";
+  json += "{ \"path\":\"/blink?left=truefalse&right=-truefalce\", \"method\":\"GET\", \"description\":\"ウィンク（3秒後戻る）\" },";
+  json += "{ \"path\":\"/se_list\", \"method\":\"GET\", \"description\":\"音声一覧\" },";
+  json += "{ \"path\":\"/se_play?name=xxx.wav\", \"method\":\"GET\", \"description\":\"音声再生\" },";
+  json += "{ \"path\":\"/setvolume?value=0~100\", \"method\":\"GET\", \"description\":\"音量変更\" },";
+  json += "{ \"path\":\"/getvolume\", \"method\":\"GET\", \"description\":\"音量取得\" }";
+  json += "]";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleBlink() {
+
+  bool left = false;
+  bool right = false;
+
+  if (server.hasArg("left")) {
+    left = server.arg("left") == "true";
+  }
+
+  if (server.hasArg("right")) {
+    right = server.arg("right") == "true";
+  }
+
+  winkLeft = left;
+  winkRight = right;
+
+  winkEndTime = millis() + 800;  // 1sec
+
+  String res = "{";
+  res += "\"ok\":true,";
+  res += "\"left\":" + String(left ? "true" : "false") + ",";
+  res += "\"right\":" + String(right ? "true" : "false");
+  res += "}";
+
+  server.send(200, "application/json", res);
+}
 
 // ===================== Setup / Loop =====================
 void setup() {
   auto cfg = M5.config();
   CoreS3.begin(cfg);
   Serial.begin(115200);
-  initSensors();
 
+  randomSeed((uint32_t)esp_random());
+  nextBlinkTime = millis() + random(2000, 6000);
+  faceSprite.setColorDepth(16);
+  faceSprite.createSprite(320, 240);
+  faceSprite.fillSprite(TFT_WHITE);
+  faceSprite.pushSprite(0, 0);
+  currentFaceMode = FACE_DRAW;
+  drawFace(0, 0, 0);
+
+  initSensors();
 
   // Display
   CoreS3.Display.fillScreen(TFT_WHITE);
@@ -653,10 +933,15 @@ void setup() {
   }
 
   // HTTP routes
+  server.on("/help", HTTP_GET, handleHelp);
   server.on("/snapshot", HTTP_GET, handleSnapshot);
   server.on("/face_list", HTTP_GET, handleFaceList);
   server.on("/se_list", HTTP_GET, handleSeList);
   server.on("/face_play", HTTP_GET, handleFacePlay);
+  server.on("/face_draw_mode", HTTP_GET, enableDrawFaceMode);
+  server.on("/face_play_mode", HTTP_GET, enablePlayFaceMode);
+  server.on("/set_face_draw", HTTP_GET, handleFace);
+  server.on("/blink", HTTP_GET, handleBlink);
   server.on("/se_play", HTTP_GET, handleSePlay);
   server.on("/setvolume", HTTP_GET, handleSetVolume);
   server.on("/getvolume", HTTP_GET, handleGetVolume);
@@ -669,10 +954,9 @@ void setup() {
   bootTime = millis();
   showIP = true;
 
-  // first face
-  showNextFaceImage();
-  drawWifiStatus();
-  drawIPIfNeeded();
+
+  
+
 }
 
 void loop() {
@@ -682,21 +966,51 @@ void loop() {
 
   updateWifiState();
 
+  unsigned long now = millis();
+  if (!blinking && now >= nextBlinkTime) {
+    blinking = true;
+    blinkStartTime = now;
+  }
+  if (blinking && (now - blinkStartTime) >= BLINK_DURATION) {
+    blinking = false;
+    nextBlinkTime = now + random(2000, 6000);  // 次はランダム
+  }
+
+  if ((winkLeft || winkRight) && millis() > winkEndTime) {
+    winkLeft = false;
+    winkRight = false;
+  }
+
+
   if (millis() - lastSensorSend > 250) {
     lastSensorSend = millis();
     sendSensorPacket();
   }
+  float smooth = 0.05;  // 小さいほどゆっくり
 
+  eyeCurrentX += (eyeTargetX - eyeCurrentX) * smooth;
+  eyeCurrentY += (eyeTargetY - eyeCurrentY) * smooth;
 
-  // Face slideshow (override中は止める)
-  if (!faceOverride) {
+  // 5秒経ったら正面へ戻す
+  if (eyeAutoReturn && millis() > eyeReturnTime) {
+    eyeTargetX = 0;
+    eyeTargetY = 0;
+    eyeAutoReturn = false;
+  }
+
+  if (currentFaceMode == FACE_DRAW) {
+    if (millis() - lastFaceDraw > 33) { // 約30fps
+      lastFaceDraw = millis();
+      drawFace((int)eyeCurrentX, (int)eyeCurrentY, (int)mouthCurrent);
+    }
+  }
+
+  // ===== FACE JPEG (PlayMode) =====
+  if (currentFaceMode == FACE_JPEG) {
+
     if (millis() - lastFaceChange > FACE_INTERVAL_MS) {
       lastFaceChange = millis();
       showNextFaceImage();
-    }
-  } else {
-    if (millis() > faceOverrideUntil) {
-      faceOverride = false;
     }
   }
 
@@ -739,22 +1053,29 @@ void loop() {
     }
   }
 
-if (audioReadIndex != audioWriteIndex) {
-    if (!speakerActive) {
-        micStopIfNeeded();
-        CoreS3.Speaker.begin();
-        CoreS3.Speaker.setVolume(currentVolumeRaw);
-        speakerActive = true;
-    }
-    static int16_t chunk[1024];
-    int count = 0;
-    while (audioReadIndex != audioWriteIndex && count < 1024) {
-        chunk[count++] = audioBuffer[audioReadIndex];
-        audioReadIndex = (audioReadIndex + 1) % AUDIO_BUFFER_SIZE;
-    }
-    CoreS3.Speaker.playRaw(chunk, count, 16000, false, 1, 0);
-    lastAudioDataTime = millis();
-}
+  if (audioReadIndex != audioWriteIndex) {
+      if (!speakerActive) {
+          micStopIfNeeded();
+          CoreS3.Speaker.begin();
+          CoreS3.Speaker.setVolume(currentVolumeRaw);
+          speakerActive = true;
+      }
+      static int16_t chunk[1024];
+      int count = 0;
+      while (audioReadIndex != audioWriteIndex && count < 1024) {
+          chunk[count++] = audioBuffer[audioReadIndex];
+          audioReadIndex = (audioReadIndex + 1) % AUDIO_BUFFER_SIZE;
+      }
+      long sum = 0;
+      for (int i = 0; i < count; i++) {
+          sum += abs(chunk[i]);
+      }
+      float avg = sum / (float)count;
+      float level = constrain(avg / 250.0, 0, 100);
+      mouthCurrent += (level - mouthCurrent) * 0.4;
+      CoreS3.Speaker.playRaw(chunk, count, 16000, false, 1, 0);
+      lastAudioDataTime = millis();
+  }
 
   if (speakerActive &&
       audioReadIndex == audioWriteIndex &&
@@ -766,7 +1087,5 @@ if (audioReadIndex != audioWriteIndex) {
         micStartIfNeeded();
       }
   }
-
-  drawIPIfNeeded();
 
 }
