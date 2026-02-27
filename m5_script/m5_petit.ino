@@ -59,6 +59,10 @@ volatile bool receivingAudio = false;
 volatile bool requestMicStart = false;
 volatile bool requestMicStop = false;
 volatile bool requestAudioEnd = false;
+volatile bool requestPlaySound = false;
+volatile bool requestSleep = false;
+volatile bool requestWake = false;
+String pendingSoundName = "";
 
 uint8_t currentVolumePercent = 80;  // 0-100
 uint8_t currentVolumeRaw = 204;
@@ -789,8 +793,7 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
     case WStype_CONNECTED:
       wsClientConnected = true;
       wsClientNum = num;
-      requestMicStart = true;
-      micStartDelayTime = millis();
+      // マイクは MIC_START コマンドで明示的に起動する
       break;
 
     case WStype_DISCONNECTED:
@@ -828,13 +831,66 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
       break;
     }
 
-    case WStype_TEXT:
+    case WStype_TEXT: {
+      char* p = (char*)payload;
 
-      if (strcmp((char*)payload, "END") == 0) {
-          receivingAudio = false;
-          requestAudioEnd = true;
+      if (strcmp(p, "END") == 0) {
+        receivingAudio = false;
+        requestAudioEnd = true;
+
+      } else if (strcmp(p, "MIC_START") == 0) {
+        requestMicStart = true;
+        micStartDelayTime = millis();
+
+      } else if (strcmp(p, "MIC_STOP") == 0) {
+        requestMicStop = true;
+
+      } else if (strncmp(p, "LOOK ", 5) == 0) {
+        int x = 0, y = 0, m = -1;
+        sscanf(p + 5, "%d %d %d", &x, &y, &m);
+        eyeTargetX = x;
+        eyeTargetY = y;
+        if (m >= 0) mouthValue = m;
+        eyeReturnTime = millis() + 5000;
+        eyeAutoReturn = true;
+        currentFaceMode = FACE_DRAW;
+
+      } else if (strncmp(p, "BLINK ", 6) == 0) {
+        int l = 0, r = 0;
+        sscanf(p + 6, "%d %d", &l, &r);
+        winkLeft = l;
+        winkRight = r;
+        winkEndTime = millis() + 800;
+
+      } else if (strcmp(p, "MODE draw") == 0) {
+        currentFaceMode = FACE_DRAW;
+
+      } else if (strcmp(p, "MODE jpeg") == 0) {
+        currentFaceMode = FACE_JPEG;
+
+      } else if (strncmp(p, "VOL ", 4) == 0) {
+        int v = atoi(p + 4);
+        v = constrain(v, 0, 100);
+        currentVolumePercent = v;
+        currentVolumeRaw = map(v, 0, 100, 0, 255);
+        CoreS3.Speaker.setVolume(currentVolumeRaw);
+
+      } else if (strncmp(p, "ICON ", 5) == 0) {
+        currentIcon = String(p + 5);
+        iconStartTime = millis();
+
+      } else if (strncmp(p, "PLAY ", 5) == 0) {
+        pendingSoundName = String(p + 5);
+        requestPlaySound = true;
+
+      } else if (strcmp(p, "SLEEP") == 0) {
+        requestSleep = true;
+
+      } else if (strcmp(p, "WAKE") == 0) {
+        requestWake = true;
       }
       break;
+    }
 
     default:
       break;
@@ -1193,6 +1249,21 @@ void loop() {
   checkTouch();
 
   // Mic streaming (WS接続時のみ。camera中はOFF)
+  if (requestPlaySound) {
+    requestPlaySound = false;
+    playWavFromSD(("/wav/" + pendingSoundName).c_str());
+  }
+
+  if (requestSleep && !isSleeping) {
+    requestSleep = false;
+    enterSleepMode();
+  }
+
+  if (requestWake && isSleeping) {
+    requestWake = false;
+    wakeUp();
+  }
+
   if (requestAudioEnd) {
 
     requestAudioEnd = false;
