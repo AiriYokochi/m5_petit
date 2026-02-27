@@ -1047,6 +1047,13 @@ void setup() {
 
   // WiFi
   WiFi.mode(WIFI_STA);
+
+  // 固定IP設定（テザリング環境用）
+  IPAddress local_IP(10, 42, 138, 100);
+  IPAddress gateway(10, 42, 138, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.config(local_IP, gateway, subnet);
+
   WiFi.begin(ssid, pass);
 
   unsigned long t0 = millis();
