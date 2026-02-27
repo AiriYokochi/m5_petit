@@ -86,11 +86,13 @@ volatile bool faceDirty = true;
 volatile int eyeX = 0;        // -100 ~ +100
 volatile int eyeY = 0;
 volatile int mouthValue = 0;  // 0 ~ 100
-// ★ キャラクターカラー。書き込む前に使うキャラの行をコメントアウト解除する
-// ぷちこ（ラベンダー）IP: 10.42.138.100
+// ★ 書き込むキャラの行だけコメントアウトを外す（1行だけ有効にすること）
+// ぷちこ（ラベンダー）
 #define DEFAULT_FACE_COLOR "cab8d9"
-// ぷちてゃ（カナリーイエロー）IP: 10.42.138.101
+#define STATIC_IP_LAST 100
+// ぷちてゃ（カナリーイエロー）
 // #define DEFAULT_FACE_COLOR "fff262"
+// #define STATIC_IP_LAST 101
 
 volatile uint16_t currentFaceColor = TFT_LIGHTGREY;  // setup()で上書き
 
@@ -951,6 +953,11 @@ uint16_t colorFromHex(const char* hex) {
   return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
 }
 
+void handleStatus() {
+  String json = "{\"is_sleeping\":" + String(isSleeping ? "true" : "false") + "}";
+  server.send(200, "application/json", json);
+}
+
 void handleSetColor() {
   if (!server.hasArg("color")) {
     server.send(400, "text/plain", "missing color");
@@ -1019,11 +1026,13 @@ void handleHelp() {
   json += "{ \"path\":\"/se_list\", \"method\":\"GET\", \"description\":\"音声一覧\" },";
   json += "{ \"path\":\"/se_play?name=xxx.wav\", \"method\":\"GET\", \"description\":\"音声再生\" },";
   json += "{ \"path\":\"/setvolume?value=0~100\", \"method\":\"GET\", \"description\":\"音量変更\" },";
-  json += "{ \"path\":\"/getvolume\", \"method\":\"GET\", \"description\":\"音量取得\" }";
-  json += "{ \"path\":\"/sleep\", \"method\":\"GET\", \"description\":\"スリープモード\" }";
-  json += "{ \"path\":\"/wake\", \"method\":\"GET\", \"description\":\"ウェイクモード\" }";
-  json += "{ \"path\":\"/icon_list\", \"method\":\"GET\", \"description\":\"アイコンのリスト取得\" }";
-  json += "{ \"path\":\"/icon_play\", \"method\":\"GET\", \"description\":\"アイコン表示\" }";
+  json += "{ \"path\":\"/getvolume\", \"method\":\"GET\", \"description\":\"音量取得\" },";
+  json += "{ \"path\":\"/sleep\", \"method\":\"GET\", \"description\":\"スリープモード\" },";
+  json += "{ \"path\":\"/wake\", \"method\":\"GET\", \"description\":\"ウェイクモード\" },";
+  json += "{ \"path\":\"/icon_list\", \"method\":\"GET\", \"description\":\"アイコンのリスト取得\" },";
+  json += "{ \"path\":\"/icon_play?name=love|cry\", \"method\":\"GET\", \"description\":\"アイコン表示\" },";
+  json += "{ \"path\":\"/status\", \"method\":\"GET\", \"description\":\"状態取得（is_sleeping）\" },";
+  json += "{ \"path\":\"/set_color?color=RRGGBB\", \"method\":\"GET\", \"description\":\"顔の色変更\" }";
   json += "]";
   json += "}";
   server.send(200, "application/json", json);
@@ -1137,7 +1146,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
 
   // 固定IP設定（テザリング環境用）
-  IPAddress local_IP(10, 42, 138, 100);
+  IPAddress local_IP(10, 42, 138, STATIC_IP_LAST);
   IPAddress gateway(10, 42, 138, 1);
   IPAddress subnet(255, 255, 255, 0);
   WiFi.config(local_IP, gateway, subnet);
@@ -1175,6 +1184,7 @@ void setup() {
   server.on("/getvolume", HTTP_GET, handleGetVolume);
   server.on("/icon_list", HTTP_GET, handleIconList);
   server.on("/icon_play", HTTP_GET, handleIconPlay);
+  server.on("/status", HTTP_GET, handleStatus);
   server.on("/set_color", HTTP_GET, handleSetColor);
   server.on("/sleep", HTTP_GET, []() {
     server.send(200, "text/plain", "sleeping");
