@@ -86,6 +86,13 @@ volatile bool faceDirty = true;
 volatile int eyeX = 0;        // -100 ~ +100
 volatile int eyeY = 0;
 volatile int mouthValue = 0;  // 0 ~ 100
+// ★ キャラクターカラー。書き込む前に使うキャラの行をコメントアウト解除する
+// ぷちこ（ラベンダー）IP: 10.42.138.100
+#define DEFAULT_FACE_COLOR "cab8d9"
+// ぷちてゃ（カナリーイエロー）IP: 10.42.138.101
+// #define DEFAULT_FACE_COLOR "fff262"
+
+volatile uint16_t currentFaceColor = TFT_LIGHTGREY;  // setup()で上書き
 
 // ===== 視線制御 =====
 float eyeCurrentX = 0;
@@ -345,7 +352,7 @@ void drawFace(int eyeOffsetX, int eyeOffsetY, int mouthOpen) {
   int mo = constrain(mouthOpen, 0, 100);
   int mouthSize = 20 + mo * 20 / 100;
 
-  uint16_t faceColor = TFT_LIGHTGREY;
+  uint16_t faceColor = currentFaceColor;
 
   faceSprite.fillSprite(TFT_WHITE);
 
@@ -888,6 +895,9 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
 
       } else if (strcmp(p, "WAKE") == 0) {
         requestWake = true;
+
+      } else if (strncmp(p, "COLOR ", 6) == 0) {
+        currentFaceColor = colorFromHex(p + 6);
       }
       break;
     }
@@ -929,6 +939,26 @@ static int clampInt(int v, int lo, int hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
+}
+
+// "#RRGGBB" or "RRGGBB" → RGB565
+uint16_t colorFromHex(const char* hex) {
+  if (hex[0] == '#') hex++;
+  long c = strtol(hex, nullptr, 16);
+  uint8_t r = (c >> 16) & 0xFF;
+  uint8_t g = (c >> 8)  & 0xFF;
+  uint8_t b =  c        & 0xFF;
+  return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
+}
+
+void handleSetColor() {
+  if (!server.hasArg("color")) {
+    server.send(400, "text/plain", "missing color");
+    return;
+  }
+  String hex = server.arg("color");
+  currentFaceColor = colorFromHex(hex.c_str());
+  server.send(200, "text/plain", "ok");
 }
 
 void handleFace() {
@@ -1059,6 +1089,8 @@ void setup() {
   CoreS3.begin(cfg);
   Serial.begin(115200);
 
+  currentFaceColor = colorFromHex(DEFAULT_FACE_COLOR);
+
   randomSeed((uint32_t)esp_random());
   nextBlinkTime = millis() + random(2000, 6000);
   faceSprite.setColorDepth(16);
@@ -1143,6 +1175,7 @@ void setup() {
   server.on("/getvolume", HTTP_GET, handleGetVolume);
   server.on("/icon_list", HTTP_GET, handleIconList);
   server.on("/icon_play", HTTP_GET, handleIconPlay);
+  server.on("/set_color", HTTP_GET, handleSetColor);
   server.on("/sleep", HTTP_GET, []() {
     server.send(200, "text/plain", "sleeping");
     delay(100);
