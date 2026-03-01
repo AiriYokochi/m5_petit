@@ -6,8 +6,11 @@
 #include <SD.h>
 #include <WebSocketsServer.h>
 
-const char* ssid = "<SSID>";
-const char* pass = "<PASSWORD>";
+// WiFi設定（優先順位順：ssid1が繋がらなければssid2にフォールバック）
+const char* ssid1 = "<PHONE_SSID>";
+const char* pass1 = "<PHONE_PASSWORD>";
+const char* ssid2 = "<HOME_SSID>";
+const char* pass2 = "<HOME_PASSWORD>";
 
 // ===================== Files / SD =====================
 File faceDir;
@@ -25,7 +28,16 @@ String ipString;
 unsigned long lastWifiCheck = 0;
 unsigned long lastReconnectTry = 0;
 bool wifiConnected = false;
+int reconnectAttempt = 0;
+
+// ===================== Brightness =====================
+const uint8_t DEFAULT_BRIGHTNESS = 80;
+uint8_t currentBrightness = 80;  // 0-255
 static unsigned long lastSensorSend = 0;
+
+// ===================== Power saving =====================
+bool powerSaveMode = false;
+static unsigned long lastBatteryCheck = 0;
 
 // ===================== Face slideshow =====================
 unsigned long lastFaceChange = 0;
@@ -197,6 +209,11 @@ void checkTouch() {
     int x = touch.x;
     int y = touch.y;
     Serial.printf("Touch: %d, %d\n", x, y);
+    // 脊髄反射：タッチで目をつぶる
+    if (!blinking) {
+      blinking = true;
+      blinkStartTime = millis();
+    }
     sendTouchEvent(x, y);
   }
 }
@@ -524,7 +541,7 @@ void enterSleepMode() {
 
 void wakeUp() {
   Serial.println("Waking up...");
-  CoreS3.Display.setBrightness(200);
+  CoreS3.Display.setBrightness(currentBrightness);
   playWavFromSD("/wav/wakeup.wav");
   faceSprite.fillSprite(TFT_WHITE);
   faceSprite.pushSprite(0, 0);
@@ -678,8 +695,6 @@ void handleSnapshot() {
     return;
   }
 
-  playWavFromSD("/wav/camera.wav");
-
   server.setContentLength(out_len);
   server.send(200, "image/jpeg", "");
   WiFiClient client = server.client();
@@ -717,9 +732,25 @@ void updateWifiState() {
     drawWifiStatus();
   }
 
-  if (!wifiConnected && (millis() - lastReconnectTry > 1500)) {
+  if (!wifiConnected && (millis() - lastReconnectTry > 5000)) {
     lastReconnectTry = millis();
-    WiFi.reconnect();
+    reconnectAttempt++;
+    WiFi.disconnect();
+    if (reconnectAttempt <= 3) {
+      // ssid1: スマホテザリング（固定IP）を3回試行
+      IPAddress lip(10, 42, 138, STATIC_IP_LAST);
+      IPAddress gw(10, 42, 138, 1);
+      IPAddress sn(255, 255, 255, 0);
+      WiFi.config(lip, gw, sn);
+      WiFi.begin(ssid1, pass1);
+      Serial.printf("[reconnect] trying WiFi1: %s (%d/3)\n", ssid1, reconnectAttempt);
+    } else {
+      // ssid2: 家WiFi（DHCP）
+      WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+      WiFi.begin(ssid2, pass2);
+      Serial.printf("[reconnect] trying WiFi2: %s\n", ssid2);
+      reconnectAttempt = 0;  // リセットして次の切断時はまたssid1から
+    }
   }
 }
 
@@ -900,6 +931,20 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
 
       } else if (strncmp(p, "COLOR ", 6) == 0) {
         currentFaceColor = colorFromHex(p + 6);
+
+      } else if (strncmp(p, "BRIGHTNESS ", 11) == 0) {
+        int v = atoi(p + 11);
+        v = constrain(v, 0, 100);
+        currentBrightness = map(v, 0, 100, 0, 255);
+        CoreS3.Display.setBrightness(powerSaveMode ? min((uint8_t)40, currentBrightness) : currentBrightness);
+
+      } else if (strcmp(p, "POWERSAVE ON") == 0) {
+        powerSaveMode = true;
+        CoreS3.Display.setBrightness(min((uint8_t)40, currentBrightness));
+
+      } else if (strcmp(p, "POWERSAVE OFF") == 0) {
+        powerSaveMode = false;
+        CoreS3.Display.setBrightness(currentBrightness);
       }
       break;
     }
@@ -920,6 +965,7 @@ void sendSensorPacket() {
   // ===== Power =====
   float battery = CoreS3.Power.getBatteryLevel();
   float voltage = CoreS3.Power.getBatteryVoltage();
+  int rssi = WiFi.RSSI();
   // ===== JSON =====
   String json = "{";
   json += "\"event\":\"sensors\",";
@@ -931,7 +977,9 @@ void sendSensorPacket() {
   json += "\"gx\":" + String(data.gyro.x,2) + ",";
   json += "\"gy\":" + String(data.gyro.y,2) + ",";
   json += "\"gz\":" + String(data.gyro.z,2) + ",";
-  json += "\"battery\":" + String(battery,1);
+  json += "\"battery\":" + String(battery,1) + ",";
+  json += "\"voltage\":" + String(voltage,3) + ",";
+  json += "\"rssi\":" + String(rssi);
   json += "}";
 
   webSocket.sendTXT(wsClientNum, json);
@@ -954,8 +1002,76 @@ uint16_t colorFromHex(const char* hex) {
 }
 
 void handleStatus() {
-  String json = "{\"is_sleeping\":" + String(isSleeping ? "true" : "false") + "}";
+  String json = "{";
+  json += "\"is_sleeping\":" + String(isSleeping ? "true" : "false") + ",";
+  json += "\"power_save\":" + String(powerSaveMode ? "true" : "false");
+  json += "}";
   server.send(200, "application/json", json);
+}
+
+void handleSetBrightness() {
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "missing value");
+    return;
+  }
+  int v = server.arg("value").toInt();
+  if (v < 0) v = 0;
+  if (v > 100) v = 100;
+  currentBrightness = map(v, 0, 100, 0, 255);
+  CoreS3.Display.setBrightness(currentBrightness);
+  server.send(200, "text/plain", "ok");
+}
+
+void handleGetBrightness() {
+  int pct = map(currentBrightness, 0, 255, 0, 100);
+  server.send(200, "text/plain", String(pct));
+}
+
+void handleGetSensors() {
+  if (!M5.Imu.update()) {
+    server.send(500, "text/plain", "IMU update failed");
+    return;
+  }
+  auto data = M5.Imu.getImuData();
+  uint16_t proximity = CoreS3.Ltr553.getPsValue();
+  uint16_t ambient   = CoreS3.Ltr553.getAlsValue();
+  float battery = CoreS3.Power.getBatteryLevel();
+  float voltage = CoreS3.Power.getBatteryVoltage();
+  int rssi = WiFi.RSSI();
+
+  String json = "{";
+  json += "\"ambient\":" + String(ambient) + ",";
+  json += "\"proximity\":" + String(proximity) + ",";
+  json += "\"ax\":" + String(data.accel.x,2) + ",";
+  json += "\"ay\":" + String(data.accel.y,2) + ",";
+  json += "\"az\":" + String(data.accel.z,2) + ",";
+  json += "\"gx\":" + String(data.gyro.x,2) + ",";
+  json += "\"gy\":" + String(data.gyro.y,2) + ",";
+  json += "\"gz\":" + String(data.gyro.z,2) + ",";
+  json += "\"battery\":" + String(battery,1) + ",";
+  json += "\"voltage\":" + String(voltage,3) + ",";
+  json += "\"rssi\":" + String(rssi);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetPowerSave() {
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "missing value (true/false)");
+    return;
+  }
+  String v = server.arg("value");
+  powerSaveMode = (v == "true" || v == "1");
+  if (powerSaveMode) {
+    CoreS3.Display.setBrightness(min((uint8_t)40, currentBrightness));
+  } else {
+    CoreS3.Display.setBrightness(currentBrightness);
+  }
+  server.send(200, "text/plain", powerSaveMode ? "on" : "off");
+}
+
+void handleGetPowerSave() {
+  server.send(200, "text/plain", powerSaveMode ? "true" : "false");
 }
 
 void handleSetColor() {
@@ -1032,7 +1148,14 @@ void handleHelp() {
   json += "{ \"path\":\"/icon_list\", \"method\":\"GET\", \"description\":\"アイコンのリスト取得\" },";
   json += "{ \"path\":\"/icon_play?name=love|cry\", \"method\":\"GET\", \"description\":\"アイコン表示\" },";
   json += "{ \"path\":\"/status\", \"method\":\"GET\", \"description\":\"状態取得（is_sleeping）\" },";
-  json += "{ \"path\":\"/set_color?color=RRGGBB\", \"method\":\"GET\", \"description\":\"顔の色変更\" }";
+  json += "{ \"path\":\"/set_color?color=RRGGBB\", \"method\":\"GET\", \"description\":\"顔の色変更\" },";
+  json += "{ \"path\":\"/setbrightness?value=0~100\", \"method\":\"GET\", \"description\":\"画面輝度変更\" },";
+  json += "{ \"path\":\"/getbrightness\", \"method\":\"GET\", \"description\":\"画面輝度取得\" },";
+  json += "{ \"path\":\"/sensors\", \"method\":\"GET\", \"description\":\"センサーデータ取得（IMU/照度/近接/バッテリー/RSSI）\" },";
+  json += "{ \"path\":\"/powersave?value=true|false\", \"method\":\"GET\", \"description\":\"省電力モード切替（輝度制限+描画10fps）\" },";
+  json += "{ \"path\":\"/getpowersave\", \"method\":\"GET\", \"description\":\"省電力モード状態取得\" },";
+  json += "{ \"path\":\"/upload_wav\", \"method\":\"POST\", \"description\":\"WAVファイルをSDにアップロード（multipart/form-data, field: file）\" },";
+  json += "{ \"path\":\"/upload_face\", \"method\":\"POST\", \"description\":\"顔画像(JPG)をSDにアップロード（multipart/form-data, field: file）\" }";
   json += "]";
   json += "}";
   server.send(200, "application/json", json);
@@ -1063,6 +1186,59 @@ void handleIconPlay(){
   iconStartTime = millis();
 
   server.send(200, "text/plain", "ok");
+}
+
+// ===================== Upload =====================
+void handleUploadWav() {
+  server.send(200, "text/plain", "ok");
+}
+
+void handleUploadWavData() {
+  HTTPUpload& upload = server.upload();
+  static File uploadFile;
+
+  if (upload.status == UPLOAD_FILE_START) {
+    String filename = upload.filename;
+    if (!filename.startsWith("/")) filename = "/" + filename;
+    String path = "/wav" + filename;
+    Serial.printf("[upload] WAV: %s\n", path.c_str());
+    uploadFile = SD.open(path, FILE_WRITE);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile) {
+      uploadFile.write(upload.buf, upload.currentSize);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (uploadFile) {
+      uploadFile.close();
+      Serial.printf("[upload] WAV done: %u bytes\n", upload.totalSize);
+    }
+  }
+}
+
+void handleUploadFace() {
+  server.send(200, "text/plain", "ok");
+}
+
+void handleUploadFaceData() {
+  HTTPUpload& upload = server.upload();
+  static File uploadFile;
+
+  if (upload.status == UPLOAD_FILE_START) {
+    String filename = upload.filename;
+    if (!filename.startsWith("/")) filename = "/" + filename;
+    String path = "/face" + filename;
+    Serial.printf("[upload] Face: %s\n", path.c_str());
+    uploadFile = SD.open(path, FILE_WRITE);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile) {
+      uploadFile.write(upload.buf, upload.currentSize);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (uploadFile) {
+      uploadFile.close();
+      Serial.printf("[upload] Face done: %u bytes\n", upload.totalSize);
+    }
+  }
 }
 
 void handleBlink() {
@@ -1142,23 +1318,41 @@ void setup() {
   CoreS3.Camera.sensor->set_framesize(CoreS3.Camera.sensor, FRAMESIZE_QVGA);
 
 
-  // WiFi
+  // WiFi（ssid1 → ssid2 のフォールバック）
   WiFi.mode(WIFI_STA);
 
-  // 固定IP設定（テザリング環境用）
+  // ssid1: スマホテザリング（固定IP）— 3回試行
   IPAddress local_IP(10, 42, 138, STATIC_IP_LAST);
   IPAddress gateway(10, 42, 138, 1);
   IPAddress subnet(255, 255, 255, 0);
-  WiFi.config(local_IP, gateway, subnet);
 
-  WiFi.begin(ssid, pass);
-
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
-    delay(200);
-    Serial.print(".");
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("Trying WiFi1: %s (attempt %d/3)\n", ssid1, attempt);
+    WiFi.disconnect();
+    WiFi.config(local_IP, gateway, subnet);
+    WiFi.begin(ssid1, pass1);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+      delay(200);
+      Serial.print(".");
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) break;
   }
-  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // ssid2: 家WiFi（DHCP）
+    Serial.printf("WiFi1 failed 3 times, trying WiFi2: %s\n", ssid2);
+    WiFi.disconnect();
+    WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+    WiFi.begin(ssid2, pass2);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+      delay(200);
+      Serial.print(".");
+    }
+    Serial.println();
+  }
 
   wifiConnected = (WiFi.status() == WL_CONNECTED);
   if (wifiConnected) {
@@ -1186,6 +1380,13 @@ void setup() {
   server.on("/icon_play", HTTP_GET, handleIconPlay);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/set_color", HTTP_GET, handleSetColor);
+  server.on("/setbrightness", HTTP_GET, handleSetBrightness);
+  server.on("/getbrightness", HTTP_GET, handleGetBrightness);
+  server.on("/sensors", HTTP_GET, handleGetSensors);
+  server.on("/powersave", HTTP_GET, handleSetPowerSave);
+  server.on("/getpowersave", HTTP_GET, handleGetPowerSave);
+  server.on("/upload_wav", HTTP_POST, handleUploadWav, handleUploadWavData);
+  server.on("/upload_face", HTTP_POST, handleUploadFace, handleUploadFaceData);
   server.on("/sleep", HTTP_GET, []() {
     server.send(200, "text/plain", "sleeping");
     delay(100);
@@ -1205,6 +1406,8 @@ void setup() {
   webSocket.begin();
   webSocket.onEvent(onWebSocketEvent);
 
+  CoreS3.Display.setBrightness(DEFAULT_BRIGHTNESS);
+
   bootTime = millis();
   showIP = true;
 
@@ -1220,6 +1423,16 @@ void loop() {
 
   updateWifiState();
 
+  // 低バッテリー自動スリープ（10%以下、ただし0%=充電中は除外）
+  if (!isSleeping && millis() - lastBatteryCheck > 30000) {
+    lastBatteryCheck = millis();
+    float bat = CoreS3.Power.getBatteryLevel();
+    if (bat > 0 && bat <= 10) {
+      Serial.printf("[LOW BATTERY] %.0f%% -> auto sleep\n", bat);
+      enterSleepMode();
+    }
+  }
+
   if (isSleeping) {
     auto touch = CoreS3.Touch.getDetail();
     if (touch.isPressed()) {
@@ -1232,10 +1445,6 @@ void loop() {
       if (touchCount >= 3) {
         wakeUp();
       }
-    }
-    uint16_t ambient = CoreS3.Ltr553.getAlsValue();
-    if (ambient > 2500) {
-      wakeUp();
     }
     return;
   }
@@ -1274,7 +1483,8 @@ void loop() {
   }
 
   if (currentFaceMode == FACE_DRAW) {
-    if (millis() - lastFaceDraw > 33) { // 約30fps
+    unsigned long faceInterval = powerSaveMode ? 100 : 33;  // 省電力:10fps / 通常:30fps
+    if (millis() - lastFaceDraw > faceInterval) {
       lastFaceDraw = millis();
       drawFace((int)eyeCurrentX, (int)eyeCurrentY, (int)mouthCurrent);
     }

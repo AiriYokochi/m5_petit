@@ -56,13 +56,18 @@ https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
 `m5_script/m5_petit.ino` を開いて書き換える：
 
 ```cpp
-const char* ssid = "あなたのSSID";
-const char* pass = "パスワード";
+// WiFi設定（優先順位順：ssid1が繋がらなければssid2にフォールバック）
+const char* ssid1 = "スマホテザリングのSSID";
+const char* pass1 = "パスワード";
+const char* ssid2 = "家のWiFiのSSID";
+const char* pass2 = "パスワード";
 
-// 固定IP（環境に合わせて変更）
+// 固定IP（ssid1用、テザリング環境に合わせて変更）
 IPAddress local_IP(10, 42, 138, 100);
 IPAddress gateway(10, 42, 138, 1);
 ```
+
+ssid1（スマホ）に3回接続を試み、失敗したらssid2（家WiFi/DHCP）にフォールバック。切断時の再接続も同様。
 
 ### 4. 書き込み
 
@@ -98,8 +103,27 @@ WAVが聞こえない場合は Audacity でモノラル変換する。
 | `GET /snapshot` | カメラ撮影（JPEG） |
 | `GET /face_list` | 顔画像ファイル一覧（JSON） |
 | `GET /face_play?name=xxx.jpg` | 顔画像を5秒表示 |
+| `GET /face_draw_mode` | 描画モードへ切替 |
+| `GET /face_play_mode` | スライドショーモードへ切替 |
+| `GET /set_face_draw?eyeX=&eyeY=&mouth=` | 視線・口の制御（5秒後に戻る） |
+| `GET /blink?left=true&right=false` | ウィンク |
 | `GET /se_list` | 効果音ファイル一覧（JSON） |
+| `GET /se_play?name=xxx.wav` | 効果音再生 |
+| `GET /setvolume?value=0~100` | 音量変更 |
 | `GET /getvolume` | 現在の音量取得（0〜100） |
+| `GET /icon_list` | アイコン一覧 |
+| `GET /icon_play?name=love\|cry` | アイコン表示（3秒） |
+| `GET /set_color?color=RRGGBB` | 顔の色変更 |
+| `GET /status` | 状態取得（is_sleeping, power_save） |
+| `GET /setbrightness?value=0~100` | 画面輝度変更 |
+| `GET /getbrightness` | 画面輝度取得 |
+| `GET /sensors` | センサーデータ取得（IMU/照度/近接/バッテリー/RSSI） |
+| `GET /powersave?value=true\|false` | 省電力モード切替（輝度制限+描画10fps） |
+| `GET /getpowersave` | 省電力モード状態取得 |
+| `GET /sleep` | スリープモード |
+| `GET /wake` | スリープから復帰 |
+| `POST /upload_wav` | WAVファイルをSDにアップロード（multipart/form-data） |
+| `POST /upload_face` | 顔画像(JPG)をSDにアップロード（multipart/form-data） |
 
 ---
 
@@ -124,7 +148,11 @@ WAVが聞こえない場合は Audacity でモノラル変換する。
 | `ICON cry` | 涙アイコンを3秒表示 |
 | `MIC_START` | マイクをオンにして音声ストリーム開始 |
 | `MIC_STOP` | マイクをオフ |
-| `SLEEP` | スリープモード（3回タッチか明るさで復帰） |
+| `COLOR RRGGBB` | 顔の色変更 |
+| `BRIGHTNESS value` | 画面輝度設定（0〜100） |
+| `POWERSAVE ON` | 省電力モードON |
+| `POWERSAVE OFF` | 省電力モードOFF |
+| `SLEEP` | スリープモード（3回タッチで復帰） |
 | `WAKE` | スリープから復帰 |
 
 音声を送る場合は PCM バイナリ（int16, Mono, 16000Hz）を送り、最後に `END` を送る。
@@ -140,7 +168,9 @@ WAVが聞こえない場合は Audacity でモノラル変換する。
   "proximity": 120,
   "ax": 0.01, "ay": -0.98, "az": 0.12,
   "gx": 0.00, "gy": 0.02, "gz": -0.01,
-  "battery": 83.4
+  "battery": 83.4,
+  "voltage": 3.982,
+  "rssi": -45
 }
 ```
 
@@ -159,6 +189,36 @@ WAVが聞こえない場合は Audacity でモノラル変換する。
 バイナリ（int16, Mono, 16000Hz, 約30ms毎）
 
 ---
+
+## 省電力モード
+
+`/powersave?value=true` またはWSで `POWERSAVE ON` で有効化。
+
+- 画面輝度を40以下に制限
+- 顔の描画を30fps→10fpsに削減
+- バッテリー持ち改善（おでかけ時に推奨）
+
+## 低バッテリー自動スリープ
+
+バッテリー残量が10%以下になると自動的にスリープモードに入る。完全放電を防止。
+
+> バッテリー0%は充電中を意味するため、自動スリープの対象外。
+
+## ファイルアップロード
+
+SDカードを抜き差しせずにHTTPでファイルを追加できる。
+
+```bash
+# WAVファイルをアップロード
+curl -F "file=@hello.wav" http://<IP>/upload_wav
+
+# 顔画像をアップロード
+curl -F "file=@smile.jpg" http://<IP>/upload_face
+```
+
+## タッチ反応
+
+タッチすると脊髄反射で目をつぶる（まばたき）。タッチイベントはWSでも配信される。
 
 ## 注意事項
 
