@@ -103,10 +103,12 @@ volatile int mouthValue = 0;  // 0 ~ 100
 // ぷちこ（ラベンダー）
 #define DEFAULT_FACE_COLOR "cab8d9"
 #define STATIC_IP_LAST 100
+#define HOME_IP_LAST 12
 #define MDNS_HOSTNAME "puchiko"
 // ぷちてゃ（カナリーイエロー）
 // #define DEFAULT_FACE_COLOR "fff262"
 // #define STATIC_IP_LAST 101
+// #define HOME_IP_LAST 14
 // #define MDNS_HOSTNAME "puchiteya"
 
 volatile uint16_t currentFaceColor = TFT_LIGHTGREY;  // setup()で上書き
@@ -756,8 +758,11 @@ void updateWifiState() {
       WiFi.begin(ssid1, pass1);
       Serial.printf("[reconnect] trying WiFi1: %s (%d/3)\n", ssid1, reconnectAttempt);
     } else {
-      // ssid2: 家WiFi（DHCP）
-      WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+      // ssid2: 家WiFi（固定IP）
+      IPAddress home_lip(192, 168, 1, HOME_IP_LAST);
+      IPAddress home_gw(192, 168, 1, 1);
+      IPAddress home_sn(255, 255, 255, 0);
+      WiFi.config(home_lip, home_gw, home_sn);
       WiFi.begin(ssid2, pass2);
       Serial.printf("[reconnect] trying WiFi2: %s\n", ssid2);
       reconnectAttempt = 0;  // リセットして次の切断時はまたssid1から
@@ -1352,10 +1357,13 @@ void setup() {
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    // ssid2: 家WiFi（DHCP）
+    // ssid2: 家WiFi（固定IP）
     Serial.printf("WiFi1 failed 3 times, trying WiFi2: %s\n", ssid2);
     WiFi.disconnect();
-    WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
+    IPAddress home_IP(192, 168, 1, HOME_IP_LAST);
+    IPAddress home_gw(192, 168, 1, 1);
+    IPAddress home_sn(255, 255, 255, 0);
+    WiFi.config(home_IP, home_gw, home_sn);
     WiFi.begin(ssid2, pass2);
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
