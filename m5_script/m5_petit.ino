@@ -3,6 +3,7 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
 #include <SD.h>
 #include <WebSocketsServer.h>
 
@@ -102,9 +103,11 @@ volatile int mouthValue = 0;  // 0 ~ 100
 // ぷちこ（ラベンダー）
 #define DEFAULT_FACE_COLOR "cab8d9"
 #define STATIC_IP_LAST 100
+#define MDNS_HOSTNAME "puchiko"
 // ぷちてゃ（カナリーイエロー）
 // #define DEFAULT_FACE_COLOR "fff262"
 // #define STATIC_IP_LAST 101
+// #define MDNS_HOSTNAME "puchiteya"
 
 volatile uint16_t currentFaceColor = TFT_LIGHTGREY;  // setup()で上書き
 
@@ -724,6 +727,14 @@ void updateWifiState() {
     if (wifiConnected) {
       Serial.println("WiFi reconnected");
       ipString = WiFi.localIP().toString();
+      reconnectAttempt = 0;
+      // mDNS再起動
+      MDNS.end();
+      if (MDNS.begin(MDNS_HOSTNAME)) {
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addService("ws", "tcp", 8080);
+        Serial.printf("mDNS: %s.local\n", MDNS_HOSTNAME);
+      }
       playWavFromSD("/wav/success.wav");
     } else {
       Serial.println("WiFi disconnected");
@@ -1358,6 +1369,15 @@ void setup() {
   if (wifiConnected) {
     ipString = WiFi.localIP().toString();
     Serial.printf("WiFi connected: %s\n", ipString.c_str());
+
+    // mDNS: http://puchiko.local/ でアクセス可能に
+    if (MDNS.begin(MDNS_HOSTNAME)) {
+      MDNS.addService("http", "tcp", 80);
+      MDNS.addService("ws", "tcp", 8080);
+      Serial.printf("mDNS: %s.local\n", MDNS_HOSTNAME);
+    } else {
+      Serial.println("mDNS failed");
+    }
   } else {
     ipString = "0.0.0.0";
     Serial.println("WiFi NOT connected (will retry)");

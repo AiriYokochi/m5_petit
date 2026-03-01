@@ -93,6 +93,13 @@ WAVが聞こえない場合は Audacity でモノラル変換する。
 
 起動後、画面右下またはシリアルモニタ（115200baud）で確認。
 
+mDNS対応のため、IPアドレスの代わりにホスト名でもアクセス可能：
+
+- ぷちこ: `http://puchiko.local/`
+- ぷちてゃ: `http://puchiteya.local/`
+
+> ホスト名は `MDNS_HOSTNAME` で設定。WebSocketも `ws://puchiko.local:8080` で接続可能。
+
 ---
 
 ## HTTP API
