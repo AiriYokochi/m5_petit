@@ -27,51 +27,55 @@ M5CoreS3 を使ったロボット顔デバイス。
 
 ---
 
-## 導入手順（Arduino IDE）
+## 導入手順（PlatformIO）
 
-### 1. ボード追加
+### 1. PlatformIO インストール
 
-ファイル > 環境設定 > 追加のボードマネージャURL に追加：
-
+```bash
+pip install platformio
+# または VS Code の PlatformIO IDE 拡張をインストール
 ```
-https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+
+### 2. WiFi設定
+
+`m5_script/credentials.example.h` をコピーして `m5_script/credentials.h` を作成：
+
+```bash
+cp m5_script/credentials.example.h m5_script/credentials.h
 ```
 
-ツール > ボード > ボードマネージャ → `M5Stack` をインストール
-
-ボード設定：
-
-![ボード設定](img/image.png)
-
-### 2. ライブラリインストール
-
-- M5CoreS3 (1.0.1)
-- M5Stack (0.4.6)
-- M5Unified (0.2.13)
-- SD (1.3.0)
-- [WebSockets by Links2004](https://github.com/Links2004/arduinoWebSockets)（ZIPダウンロードして追加）
-
-### 3. WiFiと固定IP設定
-
-`m5_script/m5_petit.ino` を開いて書き換える：
+`credentials.h` を編集して実際の値を入れる：
 
 ```cpp
-// WiFi設定（優先順位順：ssid1が繋がらなければssid2にフォールバック）
 const char* ssid1 = "スマホテザリングのSSID";
 const char* pass1 = "パスワード";
 const char* ssid2 = "家のWiFiのSSID";
 const char* pass2 = "パスワード";
-
-// 固定IP（ssid1用、テザリング環境に合わせて変更）
-IPAddress local_IP(10, 42, 138, 100);
-IPAddress gateway(10, 42, 138, 1);
 ```
 
 ssid1（スマホ）に3回接続を試み、失敗したらssid2（家WiFi/DHCP）にフォールバック。切断時の再接続も同様。
 
-### 4. 書き込み
+固定IPはソース内の `local_IP` / `gateway` を環境に合わせて変更。
 
-Arduino IDE で M5CoreS3 に書き込む。
+### 3. ビルド＆書き込み
+
+2つの環境（`puchiko` / `puchiteya`）があり、それぞれ別の .ino をビルドする。
+`select_source.py` が `m5_script/m5_petit_<env>.ino` を自動で `src/` にコピーする。
+
+```bash
+# ビルドのみ
+pio run -e puchiko
+pio run -e puchiteya
+
+# ビルド＆書き込み
+pio run -e puchiko -t upload
+pio run -e puchiteya -t upload
+
+# シリアルモニタ
+pio device monitor
+```
+
+> ⚠️ 2つの環境を同時にビルド（`pio run`）するとメモリ不足で落ちることがあります。1つずつビルドしてください。
 
 ---
 
