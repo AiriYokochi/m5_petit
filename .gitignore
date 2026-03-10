@@ -3,3 +3,9 @@
 src/
 .vscode/
 m5_script/credentials.h
+
+m5_script/m5_petit_puchiko/credentials.h
+
+m5_script/m5_petit_puchiru/credentials.h
+
+m5_script/m5_petit_puchiteya/credentials.h

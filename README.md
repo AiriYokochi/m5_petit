@@ -47,15 +47,25 @@ cp m5_script/credentials.example.h m5_script/credentials.h
 `credentials.h` を編集して実際の値を入れる：
 
 ```cpp
-const char* ssid1 = "スマホテザリングのSSID";
+const char* ssid1 = "スマホテザリングのSSID";    // 外出時
 const char* pass1 = "パスワード";
-const char* ssid2 = "家のWiFiのSSID";
+const char* ssid2 = "家のWiFiのSSID";             // 自宅
 const char* pass2 = "パスワード";
+const char* ssid3 = "旅行用ルーターのSSID";       // GL.iNET等（任意）
+const char* pass3 = "パスワード";
+
+// WireGuard（任意。使わない場合もビルドは通る）
+#define WG_SERVER_PUBLIC_KEY  "..."
+#define WG_SERVER_IP          "..."   // PCのTailscale IPなど
+#define WG_SERVER_PORT        51820
+// キャラクターごとのWireGuard秘密鍵
+#define WG_PUCHIRU_PRIVATE_KEY  "..."
+...
 ```
 
-ssid1（スマホ）に3回接続を試み、失敗したらssid2（家WiFi/DHCP）にフォールバック。切断時の再接続も同様。
+ssid1 に3回接続を試み、失敗したら ssid2、それも失敗したら ssid3 にフォールバック。切断時の再接続も同様。
 
-固定IPはソース内の `local_IP` / `gateway` を環境に合わせて変更。
+固定IPはソース内の `STATIC_IP_LAST` / `HOME_IP_LAST` / `ROUTER_IP_LAST` で各キャラクターのIPを設定。
 
 ### 3. ビルド＆書き込み
 
@@ -235,6 +245,58 @@ curl -F "file=@smile.jpg" http://<IP>/upload_face
 
 - **マイクとスピーカーは同時使用不可**（I2S/DMA競合）。再生中はマイク停止、録音中はスピーカー停止。
 - **マイクは接続時に自動起動しない**。`MIC_START` コマンドで明示的に起動すること。
+
+---
+
+## ネットワーク構成
+
+### WiFiフォールバック
+
+M5 は起動時に以下の順で WiFi 接続を試みる：
+
+| 優先度 | SSID | 固定IP | 用途 |
+|---|---|---|---|
+| 1 | ssid1（スマホ） | 10.42.138.x | テザリング外出時 |
+| 2 | ssid2（家） | 192.168.1.x | 自宅WiFi |
+| 3 | ssid3（ルーター） | 192.168.8.x | GL.iNET MT3000経由 |
+
+すべて失敗した場合は 5 秒ごとに再試行（ssid1×3回 → ssid2×1回 → ssid3×1回 → ループ）。
+
+### 外出時の接続構成（MT3000 + Tailscale）
+
+```
+[外出先]
+スマホ（テザリング）
+    └─ WAN → [GL.iNET MT3000]
+                  └─ LAN（192.168.8.0/24）
+                        ├─ M5（192.168.8.100〜102）
+                        └─ （他のデバイス）
+
+[家のPC]
+    └─ Tailscale ──────────── MT3000（Tailscale ノード）
+                              ↓ サブネットルート 192.168.8.0/24
+                              M5 に直接アクセス可能
+```
+
+- MT3000 は **家に設置したまま**。外出時に持ち出さない。
+- M5 は MT3000 の WiFi（ssid3）に接続し、192.168.8.x の固定IPを取得。
+- PC は Tailscale で MT3000 に接続し、192.168.8.x 宛のパケットを MT3000 経由でルーティング。
+- ポートフォワードは不要（Tailscale が NAT 越えを処理）。
+
+### セキュリティ
+
+| 項目 | 対策 |
+|---|---|
+| credentials.h | `.gitignore` 済み。リポジトリにコミットされない |
+| WireGuard 秘密鍵 | credentials.h に記載。キャラクターごとに別鍵 |
+| Tailscale | ed25519 ベースの相互認証。管理コンソールで承認したデバイスのみ参加可 |
+| M5 HTTP API | 認証なし。Tailscale ネットワーク内のデバイスのみアクセス可（インターネット非公開） |
+| MT3000 管理画面 | 強いパスワードを設定すること |
+
+**リスクの整理：**
+- M5 は認証なしの HTTP サーバー。Tailscale ネットワーク参加者は誰でも操作できる。
+- Tailscale アカウントが乗っ取られると M5 への不正アクセスが可能になる → 2FA を有効化すること。
+- テザリング中（ssid1 接続時）は WireGuard も起動するが、PC が起動していなければ接続は成立しない。
 
 ---
 

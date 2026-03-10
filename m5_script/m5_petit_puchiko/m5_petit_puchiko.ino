@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <WireGuard-ESP32.h>
 #include <SD.h>
 #include <WebSocketsServer.h>
 
@@ -21,6 +22,7 @@ WebSocketsServer webSocket(8080);
 unsigned long bootTime = 0;
 bool showIP = true;
 String ipString;
+bool cameraAvailable = true;
 
 unsigned long lastWifiCheck = 0;
 unsigned long lastReconnectTry = 0;
@@ -97,10 +99,15 @@ volatile int eyeY = 0;
 volatile int mouthValue = 0;  // 0 ~ 100
 // ★ 書き込むキャラの行だけコメントアウトを外す（1行だけ有効にすること）
 // ぷちこ（ラベンダー）
-#define DEFAULT_FACE_COLOR "00afcc"
-#define STATIC_IP_LAST 102
-#define HOME_IP_LAST 13
-#define MDNS_HOSTNAME "puchiru"
+#define DEFAULT_FACE_COLOR "cab8d9"
+#define STATIC_IP_LAST 100
+#define HOME_IP_LAST 12
+#define ROUTER_IP_LAST 100
+#define MDNS_HOSTNAME "puchiko"
+#define WG_CLIENT_PRIVATE_KEY WG_PUCHIKO_PRIVATE_KEY
+#define WG_CLIENT_IP          WG_PUCHIKO_IP
+
+static WireGuard wg;
 
 volatile uint16_t currentFaceColor = TFT_LIGHTGREY;  // setup()で上書き
 
@@ -334,6 +341,11 @@ void drawIPIfNeededSprite() {
     faceSprite.setTextColor(TFT_GREEN, TFT_WHITE);
     faceSprite.setCursor(200, 220);
     faceSprite.print(ipString);
+    if (!cameraAvailable) {
+      faceSprite.setTextColor(TFT_RED, TFT_WHITE);
+      faceSprite.setCursor(0, 220);
+      faceSprite.print("no cam");
+    }
   }
 }
 
@@ -740,14 +752,22 @@ void updateWifiState() {
     lastReconnectTry = millis();
     reconnectAttempt++;
     WiFi.disconnect();
-    if (reconnectAttempt <= 3) {
-      // ssid1: スマホテザリング（固定IP）を3回試行
+    if (reconnectAttempt == 1) {
+      // ssid3: MT3000ルーター（固定IP）— 1回試行
+      IPAddress router_lip(192, 168, 8, ROUTER_IP_LAST);
+      IPAddress router_gw(192, 168, 8, 1);
+      IPAddress router_sn(255, 255, 255, 0);
+      WiFi.config(router_lip, router_gw, router_sn);
+      WiFi.begin(ssid3, pass3);
+      Serial.printf("[reconnect] trying WiFi3: %s\n", ssid3);
+    } else if (reconnectAttempt <= 4) {
+      // ssid1: スマホテザリング（固定IP）— 3回試行
       IPAddress lip(10, 42, 138, STATIC_IP_LAST);
       IPAddress gw(10, 42, 138, 1);
       IPAddress sn(255, 255, 255, 0);
       WiFi.config(lip, gw, sn);
       WiFi.begin(ssid1, pass1);
-      Serial.printf("[reconnect] trying WiFi1: %s (%d/3)\n", ssid1, reconnectAttempt);
+      Serial.printf("[reconnect] trying WiFi1: %s (%d/3)\n", ssid1, reconnectAttempt - 1);
     } else {
       // ssid2: 家WiFi（固定IP）
       IPAddress home_lip(192, 168, 1, HOME_IP_LAST);
@@ -756,7 +776,7 @@ void updateWifiState() {
       WiFi.config(home_lip, home_gw, home_sn);
       WiFi.begin(ssid2, pass2);
       Serial.printf("[reconnect] trying WiFi2: %s\n", ssid2);
-      reconnectAttempt = 0;  // リセットして次の切断時はまたssid1から
+      reconnectAttempt = 0;  // リセット
     }
   }
 }
@@ -786,6 +806,11 @@ void drawIPIfNeeded() {
     CoreS3.Display.setTextColor(TFT_GREEN, TFT_WHITE);
     CoreS3.Display.setCursor(200, 220);
     CoreS3.Display.print(ipString);
+    if (!cameraAvailable) {
+      CoreS3.Display.setTextColor(TFT_RED, TFT_WHITE);
+      CoreS3.Display.setCursor(0, 220);
+      CoreS3.Display.print("no cam");
+    }
   } else {
     showIP = false;
     CoreS3.Display.fillRect(0, 220, 320, 20, TFT_WHITE);
@@ -1314,35 +1339,52 @@ void setup() {
     Serial.println("Face dir open failed: /face/");
   }
 
-  // Camera（最大3回リトライ）
+  // Camera（失敗してもhaltしない）
   {
     bool camOk = false;
-    for (int i = 0; i < 3; i++) {
-      delay(300);
-      if (CoreS3.Camera.begin()) { camOk = true; break; }
-      Serial.printf("Camera Init Fail (attempt %d)\n", i + 1);
+    for (int i = 0; i < 3 && !camOk; i++) {
+      camOk = CoreS3.Camera.begin();
+      if (!camOk) delay(500);
     }
+    cameraAvailable = camOk;
     if (!camOk) {
       Serial.println("Camera Init Fail - continuing without camera");
+    } else {
+      Serial.println("Camera Init Success");
     }
   }
   if (CoreS3.Camera.sensor) {
-    Serial.println("Camera Init Success");
     CoreS3.Camera.sensor->set_framesize(CoreS3.Camera.sensor, FRAMESIZE_QVGA);
   }
 
 
-  // WiFi（ssid1 → ssid2 のフォールバック）
+  // WiFi（ssid3×1 → ssid1×3 → ssid2×1 のフォールバック）
   WiFi.mode(WIFI_STA);
 
-  // ssid1: スマホテザリング（固定IP）— 3回試行
-  IPAddress local_IP(10, 42, 138, STATIC_IP_LAST);
-  IPAddress gateway(10, 42, 138, 1);
-  IPAddress subnet(255, 255, 255, 0);
+  // ssid3: MT3000ルーター（固定IP）— 1回試行
+  {
+    Serial.printf("Trying WiFi3: %s\n", ssid3);
+    WiFi.disconnect();
+    IPAddress router_IP(192, 168, 8, ROUTER_IP_LAST);
+    IPAddress router_gw(192, 168, 8, 1);
+    IPAddress router_sn(255, 255, 255, 0);
+    WiFi.config(router_IP, router_gw, router_sn);
+    WiFi.begin(ssid3, pass3);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+      delay(200);
+      Serial.print(".");
+    }
+    Serial.println();
+  }
 
-  for (int attempt = 1; attempt <= 3; attempt++) {
+  // ssid1: スマホテザリング（固定IP）— 3回試行
+  for (int attempt = 1; attempt <= 3 && WiFi.status() != WL_CONNECTED; attempt++) {
     Serial.printf("Trying WiFi1: %s (attempt %d/3)\n", ssid1, attempt);
     WiFi.disconnect();
+    IPAddress local_IP(10, 42, 138, STATIC_IP_LAST);
+    IPAddress gateway(10, 42, 138, 1);
+    IPAddress subnet(255, 255, 255, 0);
     WiFi.config(local_IP, gateway, subnet);
     WiFi.begin(ssid1, pass1);
     unsigned long t0 = millis();
@@ -1351,12 +1393,11 @@ void setup() {
       Serial.print(".");
     }
     Serial.println();
-    if (WiFi.status() == WL_CONNECTED) break;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
     // ssid2: 家WiFi（固定IP）
-    Serial.printf("WiFi1 failed 3 times, trying WiFi2: %s\n", ssid2);
+    Serial.printf("WiFi1 failed, trying WiFi2: %s\n", ssid2);
     WiFi.disconnect();
     IPAddress home_IP(192, 168, 1, HOME_IP_LAST);
     IPAddress home_gw(192, 168, 1, 1);
@@ -1375,6 +1416,14 @@ void setup() {
   if (wifiConnected) {
     ipString = WiFi.localIP().toString();
     Serial.printf("WiFi connected: %s\n", ipString.c_str());
+
+    // WireGuard VPN
+    {
+      IPAddress wgLocalIP;
+      wgLocalIP.fromString(WG_CLIENT_IP);
+      wg.begin(wgLocalIP, WG_CLIENT_PRIVATE_KEY, WG_SERVER_IP, WG_SERVER_PUBLIC_KEY, WG_SERVER_PORT);
+      Serial.printf("WireGuard started: %s\n", WG_CLIENT_IP);
+    }
 
     // mDNS: http://puchiko.local/ でアクセス可能に
     if (MDNS.begin(MDNS_HOSTNAME)) {
