@@ -1,0 +1,1617 @@
+#include "M5CoreS3.h"
+#include "esp_camera.h"
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <SD.h>
+#include <WebSocketsServer.h>
+
+#include "credentials.h"
+
+// ===================== Files / SD =====================
+File faceDir;
+File iterFile;
+
+// ===================== Web =====================
+WebServer server(80);
+WebSocketsServer webSocket(8080);
+
+// ===================== UI / State =====================
+unsigned long bootTime = 0;
+bool showIP = true;
+String ipString;
+
+unsigned long lastWifiCheck = 0;
+unsigned long lastReconnectTry = 0;
+bool wifiConnected = false;
+int reconnectAttempt = 0;
+
+// ===================== Brightness =====================
+const uint8_t DEFAULT_BRIGHTNESS = 80;
+uint8_t currentBrightness = 80;  // 0-255
+static unsigned long lastSensorSend = 0;
+
+// ===================== Power saving =====================
+bool powerSaveMode = false;
+static unsigned long lastBatteryCheck = 0;
+
+// ===================== Face slideshow =====================
+unsigned long lastFaceChange = 0;
+const unsigned long FACE_INTERVAL_MS = 3000;
+
+bool faceOverride = false;
+unsigned long faceOverrideUntil = 0;
+
+// ===================== Mic / WS =====================
+bool wsClientConnected = false;
+uint8_t wsClientNum = 0;
+
+bool micActive = false;              // Mic.begin() 済みか
+volatile bool capturing = false;     // snapshot中か
+
+static const int MIC_BUF = 512;
+static int16_t micBuffer[MIC_BUF];
+static unsigned long lastMicSend = 0;
+
+static constexpr const size_t record_number     = 256;
+static constexpr const size_t record_length     = 320;
+static constexpr const size_t record_size       = record_number * record_length;
+static constexpr const size_t record_samplerate = 17000;
+static int16_t prev_y[record_length];
+static int16_t prev_h[record_length];
+static size_t rec_record_idx  = 2;
+static size_t draw_record_idx = 0;
+static int16_t *rec_data;
+
+volatile bool receivingAudio = false;
+volatile bool requestMicStart = false;
+volatile bool requestMicStop = false;
+volatile bool requestAudioEnd = false;
+volatile bool requestPlaySound = false;
+volatile bool requestSleep = false;
+volatile bool requestWake = false;
+String pendingSoundName = "";
+
+uint8_t currentVolumePercent = 80;  // 0-100
+uint8_t currentVolumeRaw = 204;
+static unsigned long lastFaceDraw = 0;
+// ===== リングバッファ =====
+#define AUDIO_BUFFER_SIZE 8192
+int16_t audioBuffer[AUDIO_BUFFER_SIZE];
+volatile size_t audioWriteIndex = 0;
+volatile size_t audioReadIndex  = 0;
+bool speakerActive = false;
+static unsigned long lastAudioDataTime = 0;
+volatile unsigned long micStartDelayTime = 0;
+
+Ltr5xx_Init_Basic_Para device_init_base_para = LTR5XX_BASE_PARA_CONFIG_DEFAULT;
+
+LGFX_Sprite faceSprite(&CoreS3.Display);
+volatile bool faceDirty = true; 
+
+
+// ===== Face draw params =====
+volatile int eyeX = 0;        // -100 ~ +100
+volatile int eyeY = 0;
+volatile int mouthValue = 0;  // 0 ~ 100
+// ★ 書き込むキャラの行だけコメントアウトを外す（1行だけ有効にすること）
+// ぷちこ（ラベンダー）
+#define DEFAULT_FACE_COLOR "00afcc"
+#define STATIC_IP_LAST 102
+#define HOME_IP_LAST 13
+#define MDNS_HOSTNAME "puchiru"
+
+volatile uint16_t currentFaceColor = TFT_LIGHTGREY;  // setup()で上書き
+
+// ===== 視線制御 =====
+float eyeCurrentX = 0;
+float eyeCurrentY = 0;
+float eyeTargetX = 0;
+float eyeTargetY = 0;
+unsigned long eyeReturnTime = 0;
+bool eyeAutoReturn = false;
+
+// ===== まばたき制御 =====
+bool blinking = false;
+unsigned long blinkStartTime = 0;
+unsigned long nextBlinkTime = 0;
+float mouthCurrent = 0;
+const unsigned long BLINK_DURATION = 250;
+bool winkLeft = false;
+bool winkRight = false;
+unsigned long winkEndTime = 0;
+
+bool isSleeping = false;
+int touchCount = 0;
+unsigned long lastTouchTime = 0;
+unsigned long sleepStartTime = 0;
+
+enum FaceMode {
+  FACE_JPEG,
+  FACE_DRAW
+};
+
+FaceMode currentFaceMode = FACE_DRAW;
+
+// ===== Icon animation =====
+String currentIcon = "";
+unsigned long iconStartTime = 0;
+const unsigned long ICON_DURATION = 3000;
+
+// ===================== Helpers =====================
+void drawWifiStatus();
+void drawIPIfNeeded();
+void showNextFaceImage();
+
+void initSensors() {
+
+  // ===== IMU =====
+  if (M5.Imu.begin()) {
+    Serial.println("IMU OK");
+  } else {
+    Serial.println("IMU NG");
+  }
+
+  // ===== LTR553 設定 =====
+  device_init_base_para.ps_led_pulse_freq   = LTR5XX_LED_PULSE_FREQ_40KHZ;
+  device_init_base_para.ps_measurement_rate = LTR5XX_PS_MEASUREMENT_RATE_50MS;
+  device_init_base_para.als_gain            = LTR5XX_ALS_GAIN_48X;
+
+  if (!CoreS3.Ltr553.begin(&device_init_base_para)) {
+    Serial.println("LTR553 NG");
+  } else {
+    Serial.println("LTR553 OK");
+
+    CoreS3.Ltr553.setPsMode(LTR5XX_PS_ACTIVE_MODE);
+    CoreS3.Ltr553.setAlsMode(LTR5XX_ALS_ACTIVE_MODE);
+  }
+}
+
+void micStartIfNeeded() {
+
+  if (micActive) return;
+
+  Serial.println("[MIC] starting...");
+
+  delay(10);   // ← これ重要（WiFiタスク安定待ち）
+
+  CoreS3.Speaker.end();   // 競合防止
+  speakerActive = false;
+
+  delay(5);
+
+  CoreS3.Mic.begin();
+  micActive = true;
+
+  // // フラッシュは軽く1回だけ
+  // int16_t dummy[128];
+  // CoreS3.Mic.record(dummy, 128, 16000);
+
+  Serial.println("[MIC] started");
+}
+void micStopIfNeeded() {
+  if (!micActive) return;
+
+  CoreS3.Mic.end();
+  micActive = false;
+
+  Serial.println("[MIC] end");
+}
+
+void checkTouch() {
+  auto touch = CoreS3.Touch.getDetail();
+  if (touch.isPressed()) {
+    int x = touch.x;
+    int y = touch.y;
+    Serial.printf("Touch: %d, %d\n", x, y);
+    // 脊髄反射：タッチで目をつぶる
+    if (!blinking) {
+      blinking = true;
+      blinkStartTime = millis();
+    }
+    sendTouchEvent(x, y);
+  }
+}
+
+void sendTouchEvent(int x, int y) {
+  if (!wsClientConnected) return;
+  String json = "{";
+  json += "\"event\":\"touch\",";
+  json += "\"x\":" + String(x) + ",";
+  json += "\"y\":" + String(y);
+  json += "}";
+  webSocket.sendTXT(wsClientNum, json);
+}
+
+void handleGetVolume() {
+  server.send(200, "text/plain", String(currentVolumePercent));
+}
+
+void playWavFromSD(const char* path) {
+
+  // MICを必ず止める
+  micStopIfNeeded();
+
+  CoreS3.Speaker.begin();
+  CoreS3.Speaker.setVolume(currentVolumeRaw);
+
+  File wav = SD.open(path);
+  if (!wav) {
+    Serial.printf("WAV open failed: %s\n", path);
+    CoreS3.Speaker.end();
+    speakerActive = false;
+    return;
+  }
+
+  size_t size = wav.size();
+  if (size == 0) {
+    wav.close();
+    CoreS3.Speaker.end();
+    speakerActive = false;
+    return;
+  }
+
+  uint8_t* buffer = (uint8_t*)malloc(size);
+  if (!buffer) {
+    wav.close();
+    CoreS3.Speaker.end();
+    speakerActive = false;
+    return;
+  }
+
+  wav.read(buffer, size);
+  wav.close();
+
+  CoreS3.Speaker.playWav(buffer, size);
+
+  free(buffer);
+
+  while (CoreS3.Speaker.isPlaying()) {
+    delay(1);
+  }
+
+  CoreS3.Speaker.end();
+  speakerActive = false;
+
+  // WS接続中ならマイク復帰
+  if (wsClientConnected && !capturing) {
+    micStartIfNeeded();
+  }
+}
+
+void handleSetVolume() {
+
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "missing value");
+    return;
+  }
+
+  int v = server.arg("value").toInt();
+
+  if (v < 0) v = 0;
+  if (v > 100) v = 100;
+
+  currentVolumePercent = v;
+
+  // 0-100 → 0-255へ変換
+  currentVolumeRaw = map(currentVolumePercent, 0, 100, 0, 255);
+
+  CoreS3.Speaker.setVolume(currentVolumeRaw);
+
+  Serial.printf("Volume set: %d%% (%d raw)\n",
+                currentVolumePercent,
+                currentVolumeRaw);
+
+  server.send(200, "text/plain", "ok");
+}
+void drawRotatedEllipseSprite(int cx, int cy, int rx, int ry, float angleDeg, uint16_t color) {
+
+  float angle = angleDeg * DEG_TO_RAD;
+  float cosA = cos(angle);
+  float sinA = sin(angle);
+
+  for (int x = -rx; x <= rx; x++) {
+    for (int y = -ry; y <= ry; y++) {
+
+      if ((x*x)/(float)(rx*rx) + (y*y)/(float)(ry*ry) <= 1.0) {
+
+        int xr = (int)(x * cosA - y * sinA);
+        int yr = (int)(x * sinA + y * cosA);
+
+        faceSprite.drawPixel(cx + xr, cy + yr, color);
+      }
+    }
+  }
+}
+void drawIPIfNeededSprite() {
+
+  if (!showIP) return;
+
+  if (millis() - bootTime < 30000) {
+
+    faceSprite.fillRect(0, 220, 320, 20, TFT_WHITE);
+    faceSprite.setTextColor(TFT_GREEN, TFT_WHITE);
+    faceSprite.setCursor(200, 220);
+    faceSprite.print(ipString);
+  }
+}
+
+void drawWifiStatusSprite() {
+  const int x = 200;
+  const int y = 0;
+  faceSprite.fillRect(x, y, 120, 18, TFT_WHITE);
+  if (!wifiConnected) {
+    faceSprite.setTextColor(TFT_RED, TFT_WHITE);
+    faceSprite.setCursor(x, y);
+    faceSprite.print("WiFi ERROR");
+  }
+}
+
+void drawFace(int eyeOffsetX, int eyeOffsetY, int mouthOpen) {
+
+  float t = millis() * 0.002;
+
+  int idleOffsetX = sin(t) * 5;
+  int idleOffsetY = cos(t * 0.7) * 4;
+
+  int cx = 160 + idleOffsetX;
+  int cy = 120 + idleOffsetY;
+
+  int ex = constrain(eyeOffsetX, -100, 100);
+  int ey = constrain(eyeOffsetY, -100, 100);
+
+  int eyePxX = ex * 30 / 100;
+  int eyePxY = ey * 20 / 100;
+
+  int mo = constrain(mouthOpen, 0, 100);
+  int mouthSize = 20 + mo * 20 / 100;
+
+  uint16_t faceColor = currentFaceColor;
+
+  faceSprite.fillSprite(TFT_WHITE);
+
+  // ===== 鼻（目に合わせて移動）=====
+  faceSprite.fillEllipse(
+    cx + eyePxX * 0.8,
+    cy + 1 + eyePxY * 0.8,
+    14,
+    6,
+    faceColor
+  );
+
+  // ===== 目 =====
+  int leftEyeHeight = 32;
+  int rightEyeHeight = 32;
+
+  // 通常瞬き
+  if (blinking) {
+    unsigned long dt = millis() - blinkStartTime;
+    float p = (float)dt / (float)BLINK_DURATION;
+    float tri = (p < 0.5f) ? (p * 2.0f) : ((1.0f - p) * 2.0f);
+    int h = (int)(32 - tri * 29);
+    if (h < 3) h = 3;
+    leftEyeHeight = h;
+    rightEyeHeight = h;
+  }
+
+  // ウインク優先
+  if (winkLeft) leftEyeHeight = 3;
+  if (winkRight) rightEyeHeight = 3;
+
+  drawRotatedEllipseSprite(
+    cx - 85 + eyePxX,
+    cy - 30 + eyePxY,
+    22,
+    leftEyeHeight,
+    +20,
+    faceColor
+  );
+
+  drawRotatedEllipseSprite(
+    cx + 85 + eyePxX,
+    cy - 30 + eyePxY,
+    22,
+    rightEyeHeight,
+    -20,
+    faceColor
+  );
+
+  // ===== ハート口（目と一緒に動く）=====
+  int mouthY = cy + 45 + eyePxY;
+
+  drawRotatedEllipseSprite(
+    cx - 18 + eyePxX,
+    mouthY,
+    mouthSize,
+    mouthSize,
+    -10,
+    faceColor
+  );
+
+  drawRotatedEllipseSprite(
+    cx + 18 + eyePxX,
+    mouthY,
+    mouthSize,
+    mouthSize,
+    +10,
+    faceColor
+  );
+
+  faceSprite.fillTriangle(
+    cx - 30 + eyePxX,
+    mouthY + 10,
+    cx + 30 + eyePxX,
+    mouthY + 10,
+    cx + eyePxX,
+    mouthY + 45,
+    faceColor
+  );
+  if (currentIcon != "") {
+
+    unsigned long dt = millis() - iconStartTime;
+
+    if (dt > ICON_DURATION) {
+      currentIcon = "";
+    } else {
+
+      float t = millis() * 0.005;
+
+      if (currentIcon == "love") {
+        // 右上ハート
+        int hx = 260;
+        int hy = 40 + sin(t) * 5;
+
+        faceSprite.fillCircle(hx - 6, hy, 8, TFT_RED);
+        faceSprite.fillCircle(hx + 6, hy, 8, TFT_RED);
+        faceSprite.fillTriangle(
+          hx - 14, hy,
+          hx + 14, hy,
+          hx, hy + 20,
+          TFT_RED
+        );
+      }
+
+      if (currentIcon == "cry") {
+        int leftX  = cx - 85 + eyePxX;
+        int rightX = cx + 85 + eyePxX;
+        int baseY  = cy - 5 + eyePxY;
+
+        int dropOffset = abs(sin(t)) * 10;
+
+        faceSprite.fillEllipse(leftX,  baseY + dropOffset, 5, 10, TFT_BLUE);
+        faceSprite.fillEllipse(rightX, baseY + dropOffset, 5, 10, TFT_BLUE);
+      }
+    }
+  }
+
+
+  drawWifiStatusSprite();
+  drawIPIfNeededSprite();
+
+  faceSprite.pushSprite(0,0);
+}
+void playSleepAnimation() {
+  for (int i = 0; i < 20; i++) {
+    drawFace(0, i * 2, 0);
+    delay(15);
+  }
+  for (int i = 0; i < 30; i++) {
+    blinking = true;
+    blinkStartTime = millis();
+    delay(10);
+  }
+  delay(200);
+}
+
+void enterSleepMode() {
+
+  Serial.println("Going to sleep...");
+  playSleepAnimation();
+  playWavFromSD("/wav/zzz.wav");
+  isSleeping = true;
+  touchCount = 0;
+  sleepStartTime = millis();
+
+  webSocket.disconnect();
+  micStopIfNeeded();
+  if ( speakerActive){
+    CoreS3.Speaker.end();
+    speakerActive = false;
+  }
+
+  File f = SD.open("/face/sleep.jpg");
+  if (f) {
+    size_t size = f.size();
+    uint8_t* buf = (uint8_t*)malloc(size);
+    if (buf) {
+      f.read(buf, size);
+      CoreS3.Display.drawJpg(buf, size, 0, 0);
+      free(buf);
+    }
+    f.close();
+  }
+  CoreS3.Display.setBrightness(15);
+  Serial.println("Sleep mode ON");
+}
+
+void wakeUp() {
+  Serial.println("Waking up...");
+  CoreS3.Display.setBrightness(currentBrightness);
+  playWavFromSD("/wav/wakeup.wav");
+  faceSprite.fillSprite(TFT_WHITE);
+  faceSprite.pushSprite(0, 0);
+  isSleeping = false;
+  currentFaceMode = FACE_DRAW;
+  Serial.println("Awake!");
+}
+
+void showFaceFile(const String& filename) {
+  String path = "/face/" + filename;
+  File f = SD.open(path);
+  if (!f) {
+    Serial.printf("Face open failed: %s\n", path.c_str());
+    return;
+  }
+
+  size_t size = f.size();
+  if (size == 0) { f.close(); return; }
+
+  uint8_t* buffer = (uint8_t*)malloc(size);
+  if (!buffer) {
+    f.close();
+    Serial.printf("JPG malloc failed (%u): %s\n", (unsigned)size, path.c_str());
+    return;
+  }
+
+  f.read(buffer, size);
+  f.close();
+
+  // 背景のチカチカを抑える：黒塗りしない（drawJpgが上書き）
+  CoreS3.Display.drawJpg(buffer, size, 0, 0);
+  free(buffer);
+
+  drawWifiStatus();
+  drawIPIfNeeded();
+}
+
+// ===================== API: list =====================
+void handleFaceList() {
+  File dir = SD.open("/face/");
+  if (!dir) {
+    server.send(500, "application/json", "{\"error\":\"no face dir\"}");
+    return;
+  }
+
+  String json = "[";
+  bool first = true;
+
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String n = String(f.name());
+      String lower = n; lower.toLowerCase();
+      if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+        if (!first) json += ",";
+        json += "\"" + n + "\"";
+        first = false;
+      }
+    }
+    f = dir.openNextFile();
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleSeList() {
+  File dir = SD.open("/wav/");
+  if (!dir) {
+    server.send(500, "application/json", "{\"error\":\"no wav dir\"}");
+    return;
+  }
+
+  String json = "[";
+  bool first = true;
+
+  File f = dir.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String n = String(f.name());
+      String lower = n; lower.toLowerCase();
+      if (lower.endsWith(".wav")) {
+        if (!first) json += ",";
+        json += "\"" + n + "\"";
+        first = false;
+      }
+    }
+    f = dir.openNextFile();
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+// ===================== API: play =====================
+void handleFacePlay() {
+  if (!server.hasArg("name")) {
+    server.send(400, "text/plain", "missing name");
+    return;
+  }
+  String name = server.arg("name");
+  showFaceFile(name);
+
+  faceOverride = true;
+  faceOverrideUntil = millis() + 5000;
+
+  server.send(200, "text/plain", "ok");
+}
+
+void handleSePlay() {
+  if (!server.hasArg("name")) {
+    server.send(400, "text/plain", "missing name");
+    return;
+  }
+  String name = server.arg("name");
+  String path = "/wav/" + name;
+
+  playWavFromSD(path.c_str());
+  server.send(200, "text/plain", "ok");
+}
+
+// ===================== API: snapshot =====================
+void handleSnapshot() {
+  capturing = true;
+
+  // カメラ中はマイクを完全停止（I2S/DMA競合対策）
+  micStopIfNeeded();
+
+  // 最新化（捨てフレーム）
+  CoreS3.Camera.get(); CoreS3.Camera.free(); delay(5);
+  CoreS3.Camera.get(); CoreS3.Camera.free(); delay(5);
+
+  if (!CoreS3.Camera.get()) {
+    capturing = false;
+    server.send(500, "text/plain", "Camera capture failed");
+    // 戻す
+    if (wsClientConnected) {
+      micStartIfNeeded();      
+    }
+    return;
+  }
+
+  uint8_t* out_jpg = nullptr;
+  size_t out_len = 0;
+
+  if (!frame2jpg(CoreS3.Camera.fb, 60, &out_jpg, &out_len)) {
+    CoreS3.Camera.free();
+    capturing = false;
+    server.send(500, "text/plain", "JPEG conversion failed");
+    if (wsClientConnected) {
+      micStartIfNeeded();      
+    }
+    return;
+  }
+
+  server.setContentLength(out_len);
+  server.send(200, "image/jpeg", "");
+  WiFiClient client = server.client();
+  client.write(out_jpg, out_len);
+  client.flush();
+
+  free(out_jpg);
+  CoreS3.Camera.free();
+
+  capturing = false;
+
+  // WSが繋がってるならマイク再開
+  if (wsClientConnected) {
+    micStartIfNeeded();    
+  }
+}
+
+// ===================== WiFi =====================
+void updateWifiState() {
+  if (millis() - lastWifiCheck < 500) return;
+  lastWifiCheck = millis();
+
+  bool now = (WiFi.status() == WL_CONNECTED);
+
+  if (now != wifiConnected) {
+    wifiConnected = now;
+    if (wifiConnected) {
+      Serial.println("WiFi reconnected");
+      ipString = WiFi.localIP().toString();
+      reconnectAttempt = 0;
+      // mDNS再起動
+      MDNS.end();
+      if (MDNS.begin(MDNS_HOSTNAME)) {
+        MDNS.addService("http", "tcp", 80);
+        MDNS.addService("ws", "tcp", 8080);
+        Serial.printf("mDNS: %s.local\n", MDNS_HOSTNAME);
+      }
+      playWavFromSD("/wav/success.wav");
+    } else {
+      Serial.println("WiFi disconnected");
+      playWavFromSD("/wav/failed.wav");
+    }
+    drawWifiStatus();
+  }
+
+  if (!wifiConnected && (millis() - lastReconnectTry > 5000)) {
+    lastReconnectTry = millis();
+    reconnectAttempt++;
+    WiFi.disconnect();
+    if (reconnectAttempt <= 3) {
+      // ssid1: スマホテザリング（固定IP）を3回試行
+      IPAddress lip(10, 42, 138, STATIC_IP_LAST);
+      IPAddress gw(10, 42, 138, 1);
+      IPAddress sn(255, 255, 255, 0);
+      WiFi.config(lip, gw, sn);
+      WiFi.begin(ssid1, pass1);
+      Serial.printf("[reconnect] trying WiFi1: %s (%d/3)\n", ssid1, reconnectAttempt);
+    } else {
+      // ssid2: 家WiFi（固定IP）
+      IPAddress home_lip(192, 168, 1, HOME_IP_LAST);
+      IPAddress home_gw(192, 168, 1, 1);
+      IPAddress home_sn(255, 255, 255, 0);
+      WiFi.config(home_lip, home_gw, home_sn);
+      WiFi.begin(ssid2, pass2);
+      Serial.printf("[reconnect] trying WiFi2: %s\n", ssid2);
+      reconnectAttempt = 0;  // リセットして次の切断時はまたssid1から
+    }
+  }
+}
+
+// ===================== UI =====================
+void drawWifiStatus() {
+  // 右上を白で確保（黒くしない）
+  const int x = 200;
+  const int y = 0;
+  CoreS3.Display.fillRect(x, y, 120, 18, TFT_WHITE);
+
+  CoreS3.Display.setTextSize(1);
+  if (!wifiConnected) {
+    CoreS3.Display.setTextColor(TFT_RED, TFT_WHITE);
+    CoreS3.Display.setCursor(x, y);
+    CoreS3.Display.print("WiFi ERROR");
+  }
+}
+
+void drawIPIfNeeded() {
+  if (!showIP) return;
+
+  if (millis() - bootTime < 30000) {
+    // 右下を白で上書き（黒帯にしない）
+    CoreS3.Display.fillRect(0, 220, 320, 20, TFT_WHITE);
+    CoreS3.Display.setTextSize(1);
+    CoreS3.Display.setTextColor(TFT_GREEN, TFT_WHITE);
+    CoreS3.Display.setCursor(200, 220);
+    CoreS3.Display.print(ipString);
+  } else {
+    showIP = false;
+    CoreS3.Display.fillRect(0, 220, 320, 20, TFT_WHITE);
+  }
+}
+
+// ===================== Face slideshow =====================
+void showNextFaceImage() {
+  if (!faceDir) return;
+
+  iterFile = faceDir.openNextFile();
+  if (!iterFile) {
+    faceDir.rewindDirectory();
+    iterFile = faceDir.openNextFile();
+  }
+  if (!iterFile) return;
+
+  if (iterFile.isDirectory()) { iterFile.close(); return; }
+
+  String name = String(iterFile.name());
+  String lower = name; lower.toLowerCase();
+  if (!(lower.endsWith(".jpg") || lower.endsWith(".jpeg"))) {
+    iterFile.close();
+    return;
+  }
+
+  size_t size = iterFile.size();
+  if (size == 0) { iterFile.close(); return; }
+
+  uint8_t* buffer = (uint8_t*)malloc(size);
+  if (!buffer) {
+    Serial.printf("JPG malloc failed (%u): %s\n", (unsigned)size, name.c_str());
+    iterFile.close();
+    return;
+  }
+
+  iterFile.read(buffer, size);
+  iterFile.close();
+
+  CoreS3.Display.drawJpg(buffer, size, 0, 0);
+  free(buffer);
+
+  drawWifiStatus();
+  drawIPIfNeeded();
+}
+
+// ===================== WebSocket =====================
+void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+
+  switch (type) {
+
+    case WStype_CONNECTED:
+      wsClientConnected = true;
+      wsClientNum = num;
+      // マイクは MIC_START コマンドで明示的に起動する
+      break;
+
+    case WStype_DISCONNECTED:
+      wsClientConnected = false;
+      requestMicStop = true;
+      break;
+
+    case WStype_BIN: {
+      receivingAudio = true;
+
+      if (length == 0) return;
+
+      size_t bufferSize = AUDIO_BUFFER_SIZE;
+
+      int samples = length / 2;
+
+      if (samples > 1024) {
+        samples = 1024;  // 最大制限
+      }
+
+      int16_t* pcm = (int16_t*)payload;
+
+      for (int i = 0; i < samples; i++) {
+
+        size_t next = (audioWriteIndex + 1) % bufferSize;
+
+        if (next == audioReadIndex) {
+          audioReadIndex = (audioReadIndex + 256) % bufferSize;
+        }
+
+        audioBuffer[audioWriteIndex] = pcm[i];
+        audioWriteIndex = next;
+      }
+
+      break;
+    }
+
+    case WStype_TEXT: {
+      char* p = (char*)payload;
+
+      if (strcmp(p, "END") == 0) {
+        receivingAudio = false;
+        requestAudioEnd = true;
+
+      } else if (strcmp(p, "MIC_START") == 0) {
+        requestMicStart = true;
+        micStartDelayTime = millis();
+
+      } else if (strcmp(p, "MIC_STOP") == 0) {
+        requestMicStop = true;
+
+      } else if (strncmp(p, "LOOK ", 5) == 0) {
+        int x = 0, y = 0, m = -1;
+        sscanf(p + 5, "%d %d %d", &x, &y, &m);
+        eyeTargetX = x;
+        eyeTargetY = y;
+        if (m >= 0) mouthValue = m;
+        eyeReturnTime = millis() + 5000;
+        eyeAutoReturn = true;
+        currentFaceMode = FACE_DRAW;
+
+      } else if (strncmp(p, "BLINK ", 6) == 0) {
+        int l = 0, r = 0;
+        sscanf(p + 6, "%d %d", &l, &r);
+        winkLeft = l;
+        winkRight = r;
+        winkEndTime = millis() + 800;
+
+      } else if (strcmp(p, "MODE draw") == 0) {
+        currentFaceMode = FACE_DRAW;
+
+      } else if (strcmp(p, "MODE jpeg") == 0) {
+        currentFaceMode = FACE_JPEG;
+
+      } else if (strncmp(p, "VOL ", 4) == 0) {
+        int v = atoi(p + 4);
+        v = constrain(v, 0, 100);
+        currentVolumePercent = v;
+        currentVolumeRaw = map(v, 0, 100, 0, 255);
+        CoreS3.Speaker.setVolume(currentVolumeRaw);
+
+      } else if (strncmp(p, "ICON ", 5) == 0) {
+        currentIcon = String(p + 5);
+        iconStartTime = millis();
+
+      } else if (strncmp(p, "PLAY ", 5) == 0) {
+        pendingSoundName = String(p + 5);
+        requestPlaySound = true;
+
+      } else if (strcmp(p, "SLEEP") == 0) {
+        requestSleep = true;
+
+      } else if (strcmp(p, "WAKE") == 0) {
+        requestWake = true;
+
+      } else if (strncmp(p, "COLOR ", 6) == 0) {
+        currentFaceColor = colorFromHex(p + 6);
+
+      } else if (strncmp(p, "BRIGHTNESS ", 11) == 0) {
+        int v = atoi(p + 11);
+        v = constrain(v, 0, 100);
+        currentBrightness = map(v, 0, 100, 0, 255);
+        CoreS3.Display.setBrightness(powerSaveMode ? min((uint8_t)40, currentBrightness) : currentBrightness);
+
+      } else if (strcmp(p, "POWERSAVE ON") == 0) {
+        powerSaveMode = true;
+        CoreS3.Display.setBrightness(min((uint8_t)40, currentBrightness));
+
+      } else if (strcmp(p, "POWERSAVE OFF") == 0) {
+        powerSaveMode = false;
+        CoreS3.Display.setBrightness(currentBrightness);
+      }
+      break;
+    }
+
+    default:
+      break;
+    }
+}
+
+void sendSensorPacket() {
+
+  if (!wsClientConnected) return;
+  if (!M5.Imu.update()) return;
+  auto data = M5.Imu.getImuData();
+  // ===== LTR553 =====
+  uint16_t proximity = CoreS3.Ltr553.getPsValue();
+  uint16_t ambient   = CoreS3.Ltr553.getAlsValue();
+  // ===== Power =====
+  float battery = CoreS3.Power.getBatteryLevel();
+  float voltage = CoreS3.Power.getBatteryVoltage();
+  int rssi = WiFi.RSSI();
+  // ===== JSON =====
+  String json = "{";
+  json += "\"event\":\"sensors\",";
+  json += "\"ambient\":" + String(ambient) + ",";
+  json += "\"proximity\":" + String(proximity) + ",";
+  json += "\"ax\":" + String(data.accel.x,2) + ",";
+  json += "\"ay\":" + String(data.accel.y,2) + ",";
+  json += "\"az\":" + String(data.accel.z,2) + ",";
+  json += "\"gx\":" + String(data.gyro.x,2) + ",";
+  json += "\"gy\":" + String(data.gyro.y,2) + ",";
+  json += "\"gz\":" + String(data.gyro.z,2) + ",";
+  json += "\"battery\":" + String(battery,1) + ",";
+  json += "\"voltage\":" + String(voltage,3) + ",";
+  json += "\"rssi\":" + String(rssi) + ",";
+  json += "\"lastTouchEventTime\":" + String(lastTouchTime);
+  json += "}";
+
+  webSocket.sendTXT(wsClientNum, json);
+}
+
+static int clampInt(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+// "#RRGGBB" or "RRGGBB" → RGB565
+uint16_t colorFromHex(const char* hex) {
+  if (hex[0] == '#') hex++;
+  long c = strtol(hex, nullptr, 16);
+  uint8_t r = (c >> 16) & 0xFF;
+  uint8_t g = (c >> 8)  & 0xFF;
+  uint8_t b =  c        & 0xFF;
+  return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
+}
+
+void handleStatus() {
+  String json = "{";
+  json += "\"is_sleeping\":" + String(isSleeping ? "true" : "false") + ",";
+  json += "\"power_save\":" + String(powerSaveMode ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetBrightness() {
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "missing value");
+    return;
+  }
+  int v = server.arg("value").toInt();
+  if (v < 0) v = 0;
+  if (v > 100) v = 100;
+  currentBrightness = map(v, 0, 100, 0, 255);
+  CoreS3.Display.setBrightness(currentBrightness);
+  server.send(200, "text/plain", "ok");
+}
+
+void handleGetBrightness() {
+  int pct = map(currentBrightness, 0, 255, 0, 100);
+  server.send(200, "text/plain", String(pct));
+}
+
+void handleGetSensors() {
+  if (!M5.Imu.update()) {
+    server.send(500, "text/plain", "IMU update failed");
+    return;
+  }
+  auto data = M5.Imu.getImuData();
+  uint16_t proximity = CoreS3.Ltr553.getPsValue();
+  uint16_t ambient   = CoreS3.Ltr553.getAlsValue();
+  float battery = CoreS3.Power.getBatteryLevel();
+  float voltage = CoreS3.Power.getBatteryVoltage();
+  int rssi = WiFi.RSSI();
+
+  String json = "{";
+  json += "\"ambient\":" + String(ambient) + ",";
+  json += "\"proximity\":" + String(proximity) + ",";
+  json += "\"ax\":" + String(data.accel.x,2) + ",";
+  json += "\"ay\":" + String(data.accel.y,2) + ",";
+  json += "\"az\":" + String(data.accel.z,2) + ",";
+  json += "\"gx\":" + String(data.gyro.x,2) + ",";
+  json += "\"gy\":" + String(data.gyro.y,2) + ",";
+  json += "\"gz\":" + String(data.gyro.z,2) + ",";
+  json += "\"battery\":" + String(battery,1) + ",";
+  json += "\"voltage\":" + String(voltage,3) + ",";
+  json += "\"rssi\":" + String(rssi) + ",";
+  json += "\"lastTouchEventTime\":" + String(lastTouchTime);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetPowerSave() {
+  if (!server.hasArg("value")) {
+    server.send(400, "text/plain", "missing value (true/false)");
+    return;
+  }
+  String v = server.arg("value");
+  powerSaveMode = (v == "true" || v == "1");
+  if (powerSaveMode) {
+    CoreS3.Display.setBrightness(min((uint8_t)40, currentBrightness));
+  } else {
+    CoreS3.Display.setBrightness(currentBrightness);
+  }
+  server.send(200, "text/plain", powerSaveMode ? "on" : "off");
+}
+
+void handleGetPowerSave() {
+  server.send(200, "text/plain", powerSaveMode ? "true" : "false");
+}
+
+void handleSetColor() {
+  if (!server.hasArg("color")) {
+    server.send(400, "text/plain", "missing color");
+    return;
+  }
+  String hex = server.arg("color");
+  currentFaceColor = colorFromHex(hex.c_str());
+  server.send(200, "text/plain", "ok");
+}
+
+void handleFace() {
+
+  if (server.hasArg("eyeX")) {
+    eyeTargetX = clampInt(server.arg("eyeX").toInt(), -100, 100);
+  }
+
+  if (server.hasArg("eyeY")) {
+    eyeTargetY = clampInt(server.arg("eyeY").toInt(), -100, 100);
+  }
+
+  if (server.hasArg("mouth")) {
+    mouthValue = clampInt(server.arg("mouth").toInt(), 0, 100);
+  }
+
+  // 5秒後に正面へ戻す
+  eyeReturnTime = millis() + 5000;
+  eyeAutoReturn = true;
+
+  currentFaceMode = FACE_DRAW;
+
+  String res = "{";
+  res += "\"ok\":true,";
+  res += "\"targetX\":" + String(eyeTargetX) + ",";
+  res += "\"targetY\":" + String(eyeTargetY);
+  res += "}";
+
+  server.send(200, "application/json", res);
+}
+
+void enableDrawFaceMode() {
+  currentFaceMode = FACE_DRAW;
+  CoreS3.Display.fillScreen(TFT_WHITE);
+  drawFace(eyeX, eyeY, mouthValue);;
+  lastFaceDraw = 0;
+  server.send(200, "text/plain", "ok");
+  faceDirty = true;
+}
+
+void enablePlayFaceMode() {
+  currentFaceMode = FACE_JPEG;
+  CoreS3.Display.fillScreen(TFT_WHITE);
+  lastFaceChange = 0;   // ← すぐ次画像へ
+  server.send(200, "text/plain", "ok");
+}
+void handleHelp() {
+  String json = "{";
+  json += "\"endpoints\":[";
+  json += "{ \"path\":\"/help\", \"method\":\"GET\", \"description\":\"API一覧\" },";
+  json += "{ \"path\":\"/snapshot\", \"method\":\"GET\", \"description\":\"カメラ撮影\" },";
+  json += "{ \"path\":\"/face_list\", \"method\":\"GET\", \"description\":\"顔画像一覧\" },";
+  json += "{ \"path\":\"/face_play?name=xxx.jpg\", \"method\":\"GET\", \"description\":\"顔画像表示\" },";
+  json += "{ \"path\":\"/face_draw_mode\", \"method\":\"GET\", \"description\":\"描画モードへ切替\" },";
+  json += "{ \"path\":\"/face_play_mode\", \"method\":\"GET\", \"description\":\"スライドショーモード\" },";
+  json += "{ \"path\":\"/set_face_draw?eyeX=-100~100&eyeY=-100~100\", \"method\":\"GET\", \"description\":\"視線移動（5秒後戻る）\" },";
+  json += "{ \"path\":\"/blink?left=truefalse&right=-truefalce\", \"method\":\"GET\", \"description\":\"ウィンク（3秒後戻る）\" },";
+  json += "{ \"path\":\"/se_list\", \"method\":\"GET\", \"description\":\"音声一覧\" },";
+  json += "{ \"path\":\"/se_play?name=xxx.wav\", \"method\":\"GET\", \"description\":\"音声再生\" },";
+  json += "{ \"path\":\"/setvolume?value=0~100\", \"method\":\"GET\", \"description\":\"音量変更\" },";
+  json += "{ \"path\":\"/getvolume\", \"method\":\"GET\", \"description\":\"音量取得\" },";
+  json += "{ \"path\":\"/sleep\", \"method\":\"GET\", \"description\":\"スリープモード\" },";
+  json += "{ \"path\":\"/wake\", \"method\":\"GET\", \"description\":\"ウェイクモード\" },";
+  json += "{ \"path\":\"/icon_list\", \"method\":\"GET\", \"description\":\"アイコンのリスト取得\" },";
+  json += "{ \"path\":\"/icon_play?name=love|cry\", \"method\":\"GET\", \"description\":\"アイコン表示\" },";
+  json += "{ \"path\":\"/status\", \"method\":\"GET\", \"description\":\"状態取得（is_sleeping）\" },";
+  json += "{ \"path\":\"/set_color?color=RRGGBB\", \"method\":\"GET\", \"description\":\"顔の色変更\" },";
+  json += "{ \"path\":\"/setbrightness?value=0~100\", \"method\":\"GET\", \"description\":\"画面輝度変更\" },";
+  json += "{ \"path\":\"/getbrightness\", \"method\":\"GET\", \"description\":\"画面輝度取得\" },";
+  json += "{ \"path\":\"/sensors\", \"method\":\"GET\", \"description\":\"センサーデータ取得（IMU/照度/近接/バッテリー/RSSI）\" },";
+  json += "{ \"path\":\"/powersave?value=true|false\", \"method\":\"GET\", \"description\":\"省電力モード切替（輝度制限+描画10fps）\" },";
+  json += "{ \"path\":\"/getpowersave\", \"method\":\"GET\", \"description\":\"省電力モード状態取得\" },";
+  json += "{ \"path\":\"/upload_wav\", \"method\":\"POST\", \"description\":\"WAVファイルをSDにアップロード（multipart/form-data, field: file）\" },";
+  json += "{ \"path\":\"/upload_face\", \"method\":\"POST\", \"description\":\"顔画像(JPG)をSDにアップロード（multipart/form-data, field: file）\" }";
+  json += "]";
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleIconList(){
+  String json = "{";
+  json += "\"icons\":[\"love\",\"cry\"]";
+  json += "}";
+
+  server.send(200, "application/json", json);
+}
+
+void handleIconPlay(){
+  if (!server.hasArg("name")) {
+    server.send(400, "text/plain", "missing name");
+    return;
+  }
+
+  String name = server.arg("name");
+
+  if (name != "love" && name != "cry") {
+    server.send(400, "text/plain", "unknown icon");
+    return;
+  }
+
+  currentIcon = name;
+  iconStartTime = millis();
+
+  server.send(200, "text/plain", "ok");
+}
+
+// ===================== Upload =====================
+void handleUploadWav() {
+  server.send(200, "text/plain", "ok");
+}
+
+void handleUploadWavData() {
+  HTTPUpload& upload = server.upload();
+  static File uploadFile;
+
+  if (upload.status == UPLOAD_FILE_START) {
+    String filename = upload.filename;
+    if (!filename.startsWith("/")) filename = "/" + filename;
+    String path = "/wav" + filename;
+    Serial.printf("[upload] WAV: %s\n", path.c_str());
+    uploadFile = SD.open(path, FILE_WRITE);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile) {
+      uploadFile.write(upload.buf, upload.currentSize);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (uploadFile) {
+      uploadFile.close();
+      Serial.printf("[upload] WAV done: %u bytes\n", upload.totalSize);
+    }
+  }
+}
+
+void handleUploadFace() {
+  server.send(200, "text/plain", "ok");
+}
+
+void handleUploadFaceData() {
+  HTTPUpload& upload = server.upload();
+  static File uploadFile;
+
+  if (upload.status == UPLOAD_FILE_START) {
+    String filename = upload.filename;
+    if (!filename.startsWith("/")) filename = "/" + filename;
+    String path = "/face" + filename;
+    Serial.printf("[upload] Face: %s\n", path.c_str());
+    uploadFile = SD.open(path, FILE_WRITE);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile) {
+      uploadFile.write(upload.buf, upload.currentSize);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (uploadFile) {
+      uploadFile.close();
+      Serial.printf("[upload] Face done: %u bytes\n", upload.totalSize);
+    }
+  }
+}
+
+void handleBlink() {
+
+  bool left = false;
+  bool right = false;
+
+  if (server.hasArg("left")) {
+    left = server.arg("left") == "true";
+  }
+
+  if (server.hasArg("right")) {
+    right = server.arg("right") == "true";
+  }
+
+  winkLeft = left;
+  winkRight = right;
+
+  winkEndTime = millis() + 800;  // 1sec
+
+  String res = "{";
+  res += "\"ok\":true,";
+  res += "\"left\":" + String(left ? "true" : "false") + ",";
+  res += "\"right\":" + String(right ? "true" : "false");
+  res += "}";
+
+  server.send(200, "application/json", res);
+}
+
+// ===================== Setup / Loop =====================
+void setup() {
+  auto cfg = M5.config();
+  CoreS3.begin(cfg);
+  Serial.begin(115200);
+
+  currentFaceColor = colorFromHex(DEFAULT_FACE_COLOR);
+
+  randomSeed((uint32_t)esp_random());
+  nextBlinkTime = millis() + random(2000, 6000);
+  faceSprite.setColorDepth(16);
+  faceSprite.createSprite(320, 240);
+  faceSprite.fillSprite(TFT_WHITE);
+  faceSprite.pushSprite(0, 0);
+  currentFaceMode = FACE_DRAW;
+  drawFace(0, 0, 0);
+
+  initSensors();
+
+  // Display
+  CoreS3.Display.fillScreen(TFT_WHITE);
+  CoreS3.Display.setTextColor(TFT_CYAN, TFT_WHITE);
+  CoreS3.Display.setCursor(0, 0);
+  CoreS3.Display.println("Booting...");
+
+  // SD
+  if (!SD.begin(GPIO_NUM_4)) {
+    Serial.println("SD Init Failed");
+  } else {
+    Serial.println("SD Init OK");
+  }
+
+  faceDir = SD.open("/face/");
+  if (!faceDir) {
+    Serial.println("Face dir open failed: /face/");
+  }
+
+  // Camera（最大3回リトライ）
+  {
+    bool camOk = false;
+    for (int i = 0; i < 3; i++) {
+      delay(300);
+      if (CoreS3.Camera.begin()) { camOk = true; break; }
+      Serial.printf("Camera Init Fail (attempt %d)\n", i + 1);
+    }
+    if (!camOk) {
+      Serial.println("Camera Init Fail - continuing without camera");
+    }
+  }
+  if (CoreS3.Camera.sensor) {
+    Serial.println("Camera Init Success");
+    CoreS3.Camera.sensor->set_framesize(CoreS3.Camera.sensor, FRAMESIZE_QVGA);
+  }
+
+
+  // WiFi（ssid1 → ssid2 のフォールバック）
+  WiFi.mode(WIFI_STA);
+
+  // ssid1: スマホテザリング（固定IP）— 3回試行
+  IPAddress local_IP(10, 42, 138, STATIC_IP_LAST);
+  IPAddress gateway(10, 42, 138, 1);
+  IPAddress subnet(255, 255, 255, 0);
+
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    Serial.printf("Trying WiFi1: %s (attempt %d/3)\n", ssid1, attempt);
+    WiFi.disconnect();
+    WiFi.config(local_IP, gateway, subnet);
+    WiFi.begin(ssid1, pass1);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+      delay(200);
+      Serial.print(".");
+    }
+    Serial.println();
+    if (WiFi.status() == WL_CONNECTED) break;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    // ssid2: 家WiFi（固定IP）
+    Serial.printf("WiFi1 failed 3 times, trying WiFi2: %s\n", ssid2);
+    WiFi.disconnect();
+    IPAddress home_IP(192, 168, 1, HOME_IP_LAST);
+    IPAddress home_gw(192, 168, 1, 1);
+    IPAddress home_sn(255, 255, 255, 0);
+    WiFi.config(home_IP, home_gw, home_sn);
+    WiFi.begin(ssid2, pass2);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+      delay(200);
+      Serial.print(".");
+    }
+    Serial.println();
+  }
+
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (wifiConnected) {
+    ipString = WiFi.localIP().toString();
+    Serial.printf("WiFi connected: %s\n", ipString.c_str());
+
+    // mDNS: http://puchiko.local/ でアクセス可能に
+    if (MDNS.begin(MDNS_HOSTNAME)) {
+      MDNS.addService("http", "tcp", 80);
+      MDNS.addService("ws", "tcp", 8080);
+      Serial.printf("mDNS: %s.local\n", MDNS_HOSTNAME);
+    } else {
+      Serial.println("mDNS failed");
+    }
+  } else {
+    ipString = "0.0.0.0";
+    Serial.println("WiFi NOT connected (will retry)");
+  }
+
+  // HTTP routes
+  server.on("/help", HTTP_GET, handleHelp);
+  server.on("/snapshot", HTTP_GET, handleSnapshot);
+  server.on("/face_list", HTTP_GET, handleFaceList);
+  server.on("/se_list", HTTP_GET, handleSeList);
+  server.on("/face_play", HTTP_GET, handleFacePlay);
+  server.on("/face_draw_mode", HTTP_GET, enableDrawFaceMode);
+  server.on("/face_play_mode", HTTP_GET, enablePlayFaceMode);
+  server.on("/set_face_draw", HTTP_GET, handleFace);
+  server.on("/blink", HTTP_GET, handleBlink);
+  server.on("/se_play", HTTP_GET, handleSePlay);
+  server.on("/setvolume", HTTP_GET, handleSetVolume);
+  server.on("/getvolume", HTTP_GET, handleGetVolume);
+  server.on("/icon_list", HTTP_GET, handleIconList);
+  server.on("/icon_play", HTTP_GET, handleIconPlay);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/set_color", HTTP_GET, handleSetColor);
+  server.on("/setbrightness", HTTP_GET, handleSetBrightness);
+  server.on("/getbrightness", HTTP_GET, handleGetBrightness);
+  server.on("/sensors", HTTP_GET, handleGetSensors);
+  server.on("/powersave", HTTP_GET, handleSetPowerSave);
+  server.on("/getpowersave", HTTP_GET, handleGetPowerSave);
+  server.on("/upload_wav", HTTP_POST, handleUploadWav, handleUploadWavData);
+  server.on("/upload_face", HTTP_POST, handleUploadFace, handleUploadFaceData);
+  server.on("/sleep", HTTP_GET, []() {
+    server.send(200, "text/plain", "sleeping");
+    delay(100);
+    enterSleepMode();
+  });
+  server.on("/wake", HTTP_GET, []() {
+    server.send(200, "text/plain", "waking");
+    delay(50);
+    if (isSleeping) {
+      wakeUp();
+    }
+  });
+
+  server.begin();
+
+  // WebSocket
+  webSocket.begin();
+  webSocket.onEvent(onWebSocketEvent);
+
+  CoreS3.Display.setBrightness(DEFAULT_BRIGHTNESS);
+
+  bootTime = millis();
+  showIP = true;
+
+
+  
+
+}
+
+void loop() {
+  CoreS3.update();
+  server.handleClient();
+  webSocket.loop();
+
+  updateWifiState();
+
+  // 低バッテリー自動スリープ（10%以下、ただし0%=充電中は除外）
+  if (!isSleeping && millis() - lastBatteryCheck > 30000) {
+    lastBatteryCheck = millis();
+    float bat = CoreS3.Power.getBatteryLevel();
+    if (bat > 0 && bat <= 10) {
+      Serial.printf("[LOW BATTERY] %.0f%% -> auto sleep\n", bat);
+      enterSleepMode();
+    }
+  }
+
+  if (isSleeping) {
+    auto touch = CoreS3.Touch.getDetail();
+    if (touch.isPressed()) {
+      if (millis() - lastTouchTime < 1000) {
+        touchCount++;
+      } else {
+        touchCount = 1;
+      }
+      lastTouchTime = millis();
+      if (touchCount >= 3) {
+        wakeUp();
+      }
+    }
+    return;
+  }
+
+
+  unsigned long now = millis();
+  if (!blinking && now >= nextBlinkTime) {
+    blinking = true;
+    blinkStartTime = now;
+  }
+  if (blinking && (now - blinkStartTime) >= BLINK_DURATION) {
+    blinking = false;
+    nextBlinkTime = now + random(2000, 6000);  // 次はランダム
+  }
+
+  if ((winkLeft || winkRight) && millis() > winkEndTime) {
+    winkLeft = false;
+    winkRight = false;
+  }
+
+
+  if (millis() - lastSensorSend > 250) {
+    lastSensorSend = millis();
+    sendSensorPacket();
+  }
+  float smooth = 0.05;  // 小さいほどゆっくり
+
+  eyeCurrentX += (eyeTargetX - eyeCurrentX) * smooth;
+  eyeCurrentY += (eyeTargetY - eyeCurrentY) * smooth;
+
+  // 5秒経ったら正面へ戻す
+  if (eyeAutoReturn && millis() > eyeReturnTime) {
+    eyeTargetX = 0;
+    eyeTargetY = 0;
+    eyeAutoReturn = false;
+  }
+
+  if (currentFaceMode == FACE_DRAW) {
+    unsigned long faceInterval = powerSaveMode ? 100 : 33;  // 省電力:10fps / 通常:30fps
+    if (millis() - lastFaceDraw > faceInterval) {
+      lastFaceDraw = millis();
+      drawFace((int)eyeCurrentX, (int)eyeCurrentY, (int)mouthCurrent);
+    }
+  }
+
+  // ===== FACE JPEG (PlayMode) =====
+  if (currentFaceMode == FACE_JPEG) {
+
+    if (millis() - lastFaceChange > FACE_INTERVAL_MS) {
+      lastFaceChange = millis();
+      showNextFaceImage();
+    }
+  }
+
+  checkTouch();
+
+  // Mic streaming (WS接続時のみ。camera中はOFF)
+  if (requestPlaySound) {
+    requestPlaySound = false;
+    playWavFromSD(("/wav/" + pendingSoundName).c_str());
+  }
+
+  if (requestSleep && !isSleeping) {
+    requestSleep = false;
+    enterSleepMode();
+  }
+
+  if (requestWake && isSleeping) {
+    requestWake = false;
+    wakeUp();
+  }
+
+  if (requestAudioEnd) {
+
+    requestAudioEnd = false;
+    CoreS3.Speaker.end();
+    speakerActive = false;
+    Serial.println("Playback finished");
+    if (wsClientConnected && !capturing) {
+      micStartIfNeeded();
+    }
+  }
+
+  if (requestMicStart &&
+      millis() - micStartDelayTime > 200) {
+      requestMicStart = false;
+      if (!capturing) {
+          micStartIfNeeded();
+      }
+  }
+  if (requestMicStop) {
+    requestMicStop = false;
+    if (!speakerActive) {
+      micStopIfNeeded();
+    }
+  }
+
+  if (wsClientConnected && micActive && !capturing && !speakerActive) {
+    if (millis() - lastMicSend > 30) {
+      lastMicSend = millis();
+      if (CoreS3.Mic.record(micBuffer, MIC_BUF, 16000)) {
+        webSocket.sendBIN(wsClientNum,
+                          (uint8_t*)micBuffer,
+                          MIC_BUF * sizeof(int16_t));
+      }
+    }
+  }
+
+  if (audioReadIndex != audioWriteIndex) {
+      if (!speakerActive) {
+          micStopIfNeeded();
+          CoreS3.Speaker.begin();
+          CoreS3.Speaker.setVolume(currentVolumeRaw);
+          speakerActive = true;
+      }
+      static int16_t chunk[1024];
+      int count = 0;
+      while (audioReadIndex != audioWriteIndex && count < 1024) {
+          chunk[count++] = audioBuffer[audioReadIndex];
+          audioReadIndex = (audioReadIndex + 1) % AUDIO_BUFFER_SIZE;
+      }
+      long sum = 0;
+      for (int i = 0; i < count; i++) {
+          sum += abs(chunk[i]);
+      }
+      float avg = sum / (float)count;
+      float level = constrain(avg / 250.0, 0, 100);
+      mouthCurrent += (level - mouthCurrent) * 0.4;
+      CoreS3.Speaker.playRaw(chunk, count, 16000, false, 1, 0);
+      lastAudioDataTime = millis();
+  }
+
+  if (speakerActive &&
+      audioReadIndex == audioWriteIndex &&
+      millis() - lastAudioDataTime > 100) {
+      CoreS3.Speaker.end();
+      speakerActive = false;
+      Serial.println("Playback finished");
+      if (wsClientConnected && !capturing) {
+        micStartIfNeeded();
+      }
+  }
+
+}
