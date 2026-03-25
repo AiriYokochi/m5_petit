@@ -1,6 +1,7 @@
 #include "M5CoreS3.h"
 #include "esp_camera.h"
 
+#include <time.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
@@ -134,6 +135,25 @@ int touchCount = 0;
 unsigned long lastTouchTime = 0;
 unsigned long sleepStartTime = 0;
 
+// ===== タッチメニュー =====
+enum TouchPhase { TOUCH_IDLE, TOUCH_PRESSING };
+TouchPhase touchPhase = TOUCH_IDLE;
+unsigned long touchPressStart = 0;
+int touchPressX = 0, touchPressY = 0;
+
+bool menuVisible = false;
+unsigned long menuShowTime = 0;
+const unsigned long MENU_TIMEOUT_MS = 5000;
+
+// ===== 設定メニュー =====
+bool settingsVisible = false;
+const int BRIGHTNESS_STEPS[]    = {100, 75, 50, 5, 0};
+const int VOLUME_STEPS[]        = {100, 75, 50, 25, 0};
+const int BRIGHTNESS_STEP_COUNT = 5;
+const int VOLUME_STEP_COUNT     = 5;
+int brightnessIdx = 0;
+int volumeIdx     = 0;
+
 enum FaceMode {
   FACE_JPEG,
   FACE_DRAW
@@ -150,6 +170,11 @@ const unsigned long ICON_DURATION = 3000;
 void drawWifiStatus();
 void drawIPIfNeeded();
 void showNextFaceImage();
+void drawMenuOverlay();
+void drawSettingsScreen();
+void handleTap(int x, int y);
+void handleStroke(int x, int y);
+void handleSettingsTap(int x, int y);
 
 void initSensors() {
 
@@ -208,16 +233,35 @@ void micStopIfNeeded() {
 
 void checkTouch() {
   auto touch = CoreS3.Touch.getDetail();
-  if (touch.isPressed()) {
-    int x = touch.x;
-    int y = touch.y;
-    Serial.printf("Touch: %d, %d\n", x, y);
-    // 脊髄反射：タッチで目をつぶる
-    if (!blinking) {
-      blinking = true;
-      blinkStartTime = millis();
+
+  if (touchPhase == TOUCH_IDLE) {
+    if (touch.isPressed()) {
+      touchPhase      = TOUCH_PRESSING;
+      touchPressStart = millis();
+      touchPressX     = touch.x;
+      touchPressY     = touch.y;
+      // 脊髄反射：タッチで目をつぶる
+      if (!blinking) {
+        blinking = true;
+        blinkStartTime = millis();
+      }
     }
-    sendTouchEvent(x, y);
+  } else {
+    if (!touch.isPressed()) {
+      unsigned long dur = millis() - touchPressStart;
+      if (dur < 600) {
+        handleTap(touchPressX, touchPressY);
+      } else {
+        handleStroke(touchPressX, touchPressY);
+      }
+      touchPhase = TOUCH_IDLE;
+    }
+  }
+
+  // メニュータイムアウト
+  if (menuVisible && millis() - menuShowTime > MENU_TIMEOUT_MS) {
+    menuVisible = false;
+    faceDirty = true;
   }
 }
 
@@ -229,6 +273,194 @@ void sendTouchEvent(int x, int y) {
   json += "\"y\":" + String(y);
   json += "}";
   webSocket.sendTXT(wsClientNum, json);
+}
+
+int menuItemAt(int x, int y) {
+  // 0=camera(左上) 1=sensor(右上) 2=mic(左下) 3=settings(右下)
+  int col = (x < 160) ? 0 : 1;
+  int row = (y < 120) ? 0 : 1;
+  return row * 2 + col;
+}
+
+void sendMenuSelectEvent(int item) {
+  if (!wsClientConnected) return;
+  const char* names[] = {"camera", "sensor", "mic", "settings"};
+  String json = "{\"event\":\"menu_select\",\"item\":\"";
+  json += names[item];
+  json += "\"}";
+  webSocket.sendTXT(wsClientNum, json);
+}
+
+void handleTap(int x, int y) {
+  if (settingsVisible) {
+    handleSettingsTap(x, y);
+    return;
+  }
+  if (menuVisible) {
+    int item = menuItemAt(x, y);
+    if (item == 3) {  // settings
+      menuVisible     = false;
+      settingsVisible = true;
+      faceDirty       = true;
+    } else {
+      sendMenuSelectEvent(item);
+      menuVisible = false;
+    }
+  } else {
+    menuVisible   = true;
+    menuShowTime  = millis();
+    faceDirty     = true;
+  }
+  sendTouchEvent(x, y);
+}
+
+void handleStroke(int x, int y) {
+  // 撫でる：メニューを閉じるだけ
+  if (menuVisible)     { menuVisible = false;     faceDirty = true; }
+  if (settingsVisible) { settingsVisible = false;  faceDirty = true; }
+  sendTouchEvent(x, y);
+}
+
+void handleSettingsTap(int x, int y) {
+  if (y < 36) {
+    // 時刻エリア：何もしない
+  } else if (y < 85) {
+    // 明るさ: 左半分=ダウン、右半分=アップ
+    if (x < 160) { if (brightnessIdx < BRIGHTNESS_STEP_COUNT - 1) brightnessIdx++; }
+    else          { if (brightnessIdx > 0) brightnessIdx--; }
+    currentBrightness = map(BRIGHTNESS_STEPS[brightnessIdx], 0, 100, 0, 255);
+    CoreS3.Display.setBrightness(powerSaveMode ? min((uint8_t)40, currentBrightness) : currentBrightness);
+  } else if (y < 134) {
+    // 音量: 左半分=ダウン、右半分=アップ
+    if (x < 160) { if (volumeIdx < VOLUME_STEP_COUNT - 1) volumeIdx++; }
+    else          { if (volumeIdx > 0) volumeIdx--; }
+    currentVolumePercent = VOLUME_STEPS[volumeIdx];
+    currentVolumeRaw     = map(currentVolumePercent, 0, 100, 0, 255);
+    CoreS3.Speaker.setVolume(currentVolumeRaw);
+  } else if (y < 183) {
+    // 省電力トグル
+    powerSaveMode = !powerSaveMode;
+    CoreS3.Display.setBrightness(powerSaveMode ? min((uint8_t)40, currentBrightness) : currentBrightness);
+  } else {
+    // 戻る
+    settingsVisible = false;
+    faceDirty       = true;
+  }
+}
+
+void drawSettingsScreen() {
+  const uint16_t BG     = faceSprite.color565( 20,  20,  40);
+  const uint16_t ROW_A  = faceSprite.color565( 50,  50,  85);
+  const uint16_t ROW_B  = faceSprite.color565( 45,  45,  75);
+  const uint16_t PS_ON  = faceSprite.color565( 30,  90,  30);
+  const uint16_t PS_OFF = faceSprite.color565( 55,  55,  90);
+  const uint16_t BACK_C = faceSprite.color565( 35,  60,  35);
+  const uint16_t DIV    = faceSprite.color565(100, 100, 140);
+
+  faceSprite.fillSprite(BG);
+
+  // 時刻
+  faceSprite.setTextColor(TFT_WHITE);
+  faceSprite.setTextSize(2);
+  struct tm t;
+  if (getLocalTime(&t, 10)) {
+    char buf[32];
+    strftime(buf, sizeof(buf), "%H:%M  %Y/%m/%d", &t);
+    faceSprite.setCursor(6, 9);
+    faceSprite.print(buf);
+  } else {
+    faceSprite.setCursor(6, 9);
+    faceSprite.print("--:--  NTP syncing");
+  }
+  faceSprite.drawFastHLine(0, 35, 320, DIV);
+
+  // 明るさ (y:36-83)
+  faceSprite.fillRect(0, 36, 320, 48, ROW_A);
+  faceSprite.drawFastVLine(159, 36, 48, DIV);
+  faceSprite.setTextSize(1); faceSprite.setCursor(6, 46);  faceSprite.print("BRIGHTNESS");
+  faceSprite.setTextSize(2); faceSprite.setCursor(6, 62);
+  faceSprite.printf("%3d%%", BRIGHTNESS_STEPS[brightnessIdx]);
+  faceSprite.setCursor(70, 54);  faceSprite.print("<<");
+  faceSprite.setCursor(190, 54); faceSprite.print(">>");
+  faceSprite.drawFastHLine(0, 84, 320, DIV);
+
+  // 音量 (y:85-132)
+  faceSprite.fillRect(0, 85, 320, 48, ROW_B);
+  faceSprite.drawFastVLine(159, 85, 48, DIV);
+  faceSprite.setTextSize(1); faceSprite.setCursor(6, 95);  faceSprite.print("VOLUME");
+  faceSprite.setTextSize(2); faceSprite.setCursor(6, 111);
+  if (VOLUME_STEPS[volumeIdx] == 0) { faceSprite.print("MUTE"); }
+  else { faceSprite.printf("%3d%%", VOLUME_STEPS[volumeIdx]); }
+  faceSprite.setCursor(70, 103);  faceSprite.print("<<");
+  faceSprite.setCursor(190, 103); faceSprite.print(">>");
+  faceSprite.drawFastHLine(0, 133, 320, DIV);
+
+  // 省電力 (y:134-181)
+  faceSprite.fillRect(0, 134, 320, 47, powerSaveMode ? PS_ON : PS_OFF);
+  faceSprite.setTextSize(2); faceSprite.setCursor(55, 151);
+  faceSprite.print(powerSaveMode ? "PSAVE:  ON" : "PSAVE: OFF");
+  faceSprite.drawFastHLine(0, 181, 320, DIV);
+
+  // 戻る (y:182-239)
+  faceSprite.fillRect(0, 182, 320, 58, BACK_C);
+  faceSprite.setTextSize(2); faceSprite.setCursor(105, 205);
+  faceSprite.print("< BACK");
+
+  faceSprite.pushSprite(0, 0);
+}
+
+void drawMenuOverlay() {
+  const uint16_t BG  = faceSprite.color565( 30,  30,  50);
+  const uint16_t BTN = faceSprite.color565( 55,  55,  90);
+  const uint16_t DIV = faceSprite.color565(120, 120, 160);
+
+  faceSprite.fillSprite(BG);
+
+  // 分割線
+  faceSprite.drawFastVLine(159, 0, 240, DIV);
+  faceSprite.drawFastHLine(0, 119, 320, DIV);
+
+  // 4ボタン背景
+  faceSprite.fillRoundRect(  4,   4, 151, 111, 8, BTN);
+  faceSprite.fillRoundRect(164,   4, 152, 111, 8, BTN);
+  faceSprite.fillRoundRect(  4, 124, 151, 112, 8, BTN);
+  faceSprite.fillRoundRect(164, 124, 152, 112, 8, BTN);
+
+  faceSprite.setTextColor(TFT_WHITE);
+
+  // Camera (左上)
+  faceSprite.setTextSize(3);
+  faceSprite.setCursor(22, 28);
+  faceSprite.print("CAM");
+  faceSprite.setTextSize(1);
+  faceSprite.setCursor(22, 82);
+  faceSprite.print("Camera");
+
+  // Sensor (右上)
+  faceSprite.setTextSize(3);
+  faceSprite.setCursor(175, 28);
+  faceSprite.print("SEN");
+  faceSprite.setTextSize(1);
+  faceSprite.setCursor(175, 82);
+  faceSprite.print("Sensor");
+
+  // Mic (左下)
+  faceSprite.setTextSize(3);
+  faceSprite.setCursor(22, 148);
+  faceSprite.print("MIC");
+  faceSprite.setTextSize(1);
+  faceSprite.setCursor(22, 202);
+  faceSprite.print("Mic");
+
+  // Settings (右下)
+  faceSprite.setTextSize(3);
+  faceSprite.setCursor(175, 148);
+  faceSprite.print("SET");
+  faceSprite.setTextSize(1);
+  faceSprite.setCursor(175, 202);
+  faceSprite.print("Settings");
+
+  faceSprite.pushSprite(0, 0);
 }
 
 void handleGetVolume() {
@@ -338,6 +570,7 @@ void drawIPIfNeededSprite() {
   if (millis() - bootTime < 30000) {
 
     faceSprite.fillRect(0, 220, 320, 20, TFT_WHITE);
+    faceSprite.setTextSize(1);
     faceSprite.setTextColor(TFT_GREEN, TFT_WHITE);
     faceSprite.setCursor(200, 220);
     faceSprite.print(ipString);
@@ -732,6 +965,7 @@ void updateWifiState() {
     if (wifiConnected) {
       Serial.println("WiFi reconnected");
       ipString = WiFi.localIP().toString();
+      showIP = true;
       reconnectAttempt = 0;
       // mDNS再起動
       MDNS.end();
@@ -760,20 +994,20 @@ void updateWifiState() {
       WiFi.config(router_lip, router_gw, router_sn);
       WiFi.begin(ssid3, pass3);
       Serial.printf("[reconnect] trying WiFi3: %s\n", ssid3);
-    } else if (reconnectAttempt <= 4) {
-      // ssid1: スマホテザリング（固定IP）— 3回試行
+    } else if (reconnectAttempt == 2) {
+      // ssid1: スマホテザリング（固定IP）— 1回試行
       IPAddress lip(10, 42, 138, STATIC_IP_LAST);
       IPAddress gw(10, 42, 138, 1);
       IPAddress sn(255, 255, 255, 0);
       WiFi.config(lip, gw, sn);
       WiFi.begin(ssid1, pass1);
-      Serial.printf("[reconnect] trying WiFi1: %s (%d/3)\n", ssid1, reconnectAttempt - 1);
+      Serial.printf("[reconnect] trying WiFi1: %s\n", ssid1);
     } else {
       // ssid2: 家WiFi（固定IP）
       IPAddress home_lip(192, 168, 1, HOME_IP_LAST);
       IPAddress home_gw(192, 168, 1, 1);
       IPAddress home_sn(255, 255, 255, 0);
-      WiFi.config(home_lip, home_gw, home_sn);
+      WiFi.config(home_lip, home_gw, home_sn, home_gw);
       WiFi.begin(ssid2, pass2);
       Serial.printf("[reconnect] trying WiFi2: %s\n", ssid2);
       reconnectAttempt = 0;  // リセット
@@ -1402,7 +1636,7 @@ void setup() {
     IPAddress home_IP(192, 168, 1, HOME_IP_LAST);
     IPAddress home_gw(192, 168, 1, 1);
     IPAddress home_sn(255, 255, 255, 0);
-    WiFi.config(home_IP, home_gw, home_sn);
+    WiFi.config(home_IP, home_gw, home_sn, home_gw);
     WiFi.begin(ssid2, pass2);
     unsigned long t0 = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
@@ -1433,6 +1667,10 @@ void setup() {
     } else {
       Serial.println("mDNS failed");
     }
+
+    // NTP 時刻同期 (JST = UTC+9)
+    configTime(9 * 3600, 0, "pool.ntp.org", "ntp.nict.jp");
+    Serial.println("NTP configured");
   } else {
     ipString = "0.0.0.0";
     Serial.println("WiFi NOT connected (will retry)");
@@ -1561,14 +1799,29 @@ void loop() {
     unsigned long faceInterval = powerSaveMode ? 100 : 33;  // 省電力:10fps / 通常:30fps
     if (millis() - lastFaceDraw > faceInterval) {
       lastFaceDraw = millis();
-      drawFace((int)eyeCurrentX, (int)eyeCurrentY, (int)mouthCurrent);
+      if (settingsVisible) {
+        drawSettingsScreen();
+      } else if (menuVisible) {
+        drawMenuOverlay();
+      } else {
+        drawFace((int)eyeCurrentX, (int)eyeCurrentY, (int)mouthCurrent);
+      }
     }
   }
 
   // ===== FACE JPEG (PlayMode) =====
   if (currentFaceMode == FACE_JPEG) {
-
-    if (millis() - lastFaceChange > FACE_INTERVAL_MS) {
+    if (settingsVisible) {
+      if (millis() - lastFaceDraw > 33) {
+        lastFaceDraw = millis();
+        drawSettingsScreen();
+      }
+    } else if (menuVisible) {
+      if (millis() - lastFaceDraw > 33) {
+        lastFaceDraw = millis();
+        drawMenuOverlay();
+      }
+    } else if (millis() - lastFaceChange > FACE_INTERVAL_MS) {
       lastFaceChange = millis();
       showNextFaceImage();
     }
