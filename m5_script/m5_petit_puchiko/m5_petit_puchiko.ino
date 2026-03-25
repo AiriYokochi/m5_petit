@@ -1,6 +1,7 @@
 #include "M5CoreS3.h"
 #include "esp_camera.h"
 
+#include "mbedtls/base64.h"
 #include <time.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -284,11 +285,65 @@ int menuItemAt(int x, int y) {
 
 void sendMenuSelectEvent(int item) {
   if (!wsClientConnected) return;
-  const char* names[] = {"camera", "sensor", "mic", "settings"};
-  String json = "{\"event\":\"menu_select\",\"item\":\"";
-  json += names[item];
-  json += "\"}";
-  webSocket.sendTXT(wsClientNum, json);
+
+  if (item == 0) {  // camera: スナップショットを撮ってbase64で送る
+    if (!cameraAvailable) {
+      webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\",\"error\":\"no camera\"}");
+      return;
+    }
+    capturing = true;
+    micStopIfNeeded();
+
+    CoreS3.Camera.get(); CoreS3.Camera.free(); delay(5);
+    CoreS3.Camera.get(); CoreS3.Camera.free(); delay(5);
+
+    if (!CoreS3.Camera.get()) {
+      capturing = false;
+      webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\",\"error\":\"capture failed\"}");
+      micStartIfNeeded();
+      return;
+    }
+
+    uint8_t* out_jpg = nullptr;
+    size_t out_len = 0;
+    if (!frame2jpg(CoreS3.Camera.fb, 60, &out_jpg, &out_len)) {
+      CoreS3.Camera.free();
+      capturing = false;
+      webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\",\"error\":\"jpeg failed\"}");
+      micStartIfNeeded();
+      return;
+    }
+    CoreS3.Camera.free();
+
+    size_t b64_len = 0;
+    mbedtls_base64_encode(nullptr, 0, &b64_len, out_jpg, out_len);
+    uint8_t* b64_buf = (uint8_t*)ps_malloc(b64_len + 1);
+    if (b64_buf) {
+      mbedtls_base64_encode(b64_buf, b64_len + 1, &b64_len, out_jpg, out_len);
+      b64_buf[b64_len] = '\0';
+      String json = "{\"event\":\"menu_select\",\"item\":\"camera\",\"data\":\"";
+      json += (char*)b64_buf;
+      json += "\"}";
+      free(b64_buf);
+      webSocket.sendTXT(wsClientNum, json);
+    } else {
+      webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\",\"error\":\"no memory\"}");
+    }
+    free(out_jpg);
+    capturing = false;
+    micStartIfNeeded();
+
+  } else if (item == 2) {  // mic: マイク自動起動
+    requestMicStart = true;
+    webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"mic\"}");
+
+  } else {
+    const char* names[] = {"camera", "sensor", "mic", "settings"};
+    String json = "{\"event\":\"menu_select\",\"item\":\"";
+    json += names[item];
+    json += "\"}";
+    webSocket.sendTXT(wsClientNum, json);
+  }
 }
 
 void handleTap(int x, int y) {
