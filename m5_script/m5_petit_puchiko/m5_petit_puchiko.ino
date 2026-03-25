@@ -81,6 +81,7 @@ volatile bool requestMicStop = false;
 volatile bool requestAudioEnd = false;
 String statusLabel = "";
 unsigned long statusLabelUntil = 0;
+bool micLoopMode = false;
 volatile bool requestPlaySound = false;
 volatile bool requestSleep = false;
 volatile bool requestWake = false;
@@ -301,7 +302,8 @@ void sendMenuSelectEvent(int item) {
   if (item == 0) {  // camera: イベントのみ送信（画像はHTTPで取得）
     webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\"}");
 
-  } else if (item == 2) {  // mic: マイク自動起動
+  } else if (item == 2) {  // mic: マイク自動起動（1回モード）
+    micLoopMode = false;
     requestMicStart = true;
     webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"mic\"}");
 
@@ -333,6 +335,10 @@ void handleTap(int x, int y) {
       sendMenuSelectEvent(item);
       menuVisible = false;
     }
+  } else if (micActive || micLoopMode) {
+    // マイク録音中またはループモード中はタップで停止
+    micLoopMode = false;
+    requestMicStop = true;
   } else {
     menuVisible   = true;
     menuShowTime  = millis();
@@ -342,8 +348,21 @@ void handleTap(int x, int y) {
 }
 
 void handleStroke(int x, int y) {
-  // 撫でる：メニューを閉じるだけ
-  if (menuVisible)     { menuVisible = false;     faceDirty = true; }
+  if (menuVisible) {
+    int item = menuItemAt(x, y);
+    if (item == 2) {  // MIC長押し → ループモード
+      menuVisible = false;
+      faceDirty = true;
+      micLoopMode = true;
+      requestMicStart = true;
+      micStartDelayTime = millis();
+      webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"mic\"}");
+      sendTouchEvent(x, y);
+      return;
+    }
+    menuVisible = false;
+    faceDirty = true;
+  }
   if (settingsVisible) { settingsVisible = false;  faceDirty = true; }
   sendTouchEvent(x, y);
 }
@@ -476,8 +495,8 @@ void drawMenuOverlay() {
   faceSprite.setCursor(22, 148);
   faceSprite.print("MIC");
   faceSprite.setTextSize(1);
-  faceSprite.setCursor(22, 202);
-  faceSprite.print("Mic");
+  faceSprite.setCursor(8, 198);
+  faceSprite.print("tap:1x  hold:loop");
 
   // Settings (右下)
   faceSprite.setTextSize(3);
@@ -539,11 +558,6 @@ void playWavFromSD(const char* path) {
 
   CoreS3.Speaker.end();
   speakerActive = false;
-
-  // WS接続中ならマイク復帰
-  if (wsClientConnected && !capturing) {
-    micStartIfNeeded();
-  }
 }
 
 void handleSetVolume() {
@@ -965,10 +979,6 @@ void handleSnapshot() {
   if (!CoreS3.Camera.get()) {
     capturing = false;
     server.send(500, "text/plain", "Camera capture failed");
-    // 戻す
-    if (wsClientConnected) {
-      micStartIfNeeded();      
-    }
     return;
   }
 
@@ -979,9 +989,6 @@ void handleSnapshot() {
     CoreS3.Camera.free();
     capturing = false;
     server.send(500, "text/plain", "JPEG conversion failed");
-    if (wsClientConnected) {
-      micStartIfNeeded();      
-    }
     return;
   }
 
@@ -995,11 +1002,6 @@ void handleSnapshot() {
   CoreS3.Camera.free();
 
   capturing = false;
-
-  // WSが繋がってるならマイク再開
-  if (wsClientConnected) {
-    micStartIfNeeded();    
-  }
 }
 
 // ===================== WiFi =====================
@@ -1154,6 +1156,7 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
     case WStype_DISCONNECTED:
       wsClientConnected = false;
       requestMicStop = true;
+      micLoopMode = false;
       break;
 
     case WStype_BIN: {
@@ -1199,6 +1202,7 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
 
       } else if (strcmp(p, "MIC_STOP") == 0) {
         requestMicStop = true;
+        micLoopMode = false;
 
       } else if (strncmp(p, "LOOK ", 5) == 0) {
         int x = 0, y = 0, m = -1;
@@ -1900,9 +1904,6 @@ void loop() {
     CoreS3.Speaker.end();
     speakerActive = false;
     Serial.println("Playback finished");
-    if (wsClientConnected && !capturing) {
-      micStartIfNeeded();
-    }
   }
 
   if (requestMicStart &&
@@ -1976,8 +1977,9 @@ void loop() {
       CoreS3.Speaker.end();
       speakerActive = false;
       Serial.println("Playback finished");
-      if (wsClientConnected && !capturing) {
-        micStartIfNeeded();
+      if (micLoopMode && wsClientConnected && !capturing) {
+        requestMicStart = true;
+        micStartDelayTime = millis();
       }
   }
 
