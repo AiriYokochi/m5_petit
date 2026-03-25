@@ -58,6 +58,11 @@ static const int MIC_BUF = 512;
 static int16_t micBuffer[MIC_BUF];
 static unsigned long lastMicSend = 0;
 
+// ===================== 無音検出 =====================
+static unsigned long lastSoundTime = 0;
+static const unsigned long SILENCE_TIMEOUT_MS = 2000;  // 2秒無音でマイクオフ
+static const int SILENCE_THRESHOLD = 500;               // ピーク閾値（0〜32767）
+
 static constexpr const size_t record_number     = 256;
 static constexpr const size_t record_length     = 320;
 static constexpr const size_t record_size       = record_number * record_length;
@@ -292,52 +297,8 @@ int menuItemAt(int x, int y) {
 void sendMenuSelectEvent(int item) {
   if (!wsClientConnected) return;
 
-  if (item == 0) {  // camera: スナップショットを撮ってbase64で送る
-    if (!cameraAvailable) {
-      webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\",\"error\":\"no camera\"}");
-      return;
-    }
-    capturing = true;
-    micStopIfNeeded();
-
-    CoreS3.Camera.get(); CoreS3.Camera.free(); delay(5);
-    CoreS3.Camera.get(); CoreS3.Camera.free(); delay(5);
-
-    if (!CoreS3.Camera.get()) {
-      capturing = false;
-      webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\",\"error\":\"capture failed\"}");
-      micStartIfNeeded();
-      return;
-    }
-
-    uint8_t* out_jpg = nullptr;
-    size_t out_len = 0;
-    if (!frame2jpg(CoreS3.Camera.fb, 60, &out_jpg, &out_len)) {
-      CoreS3.Camera.free();
-      capturing = false;
-      webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\",\"error\":\"jpeg failed\"}");
-      micStartIfNeeded();
-      return;
-    }
-    CoreS3.Camera.free();
-
-    size_t b64_len = 0;
-    mbedtls_base64_encode(nullptr, 0, &b64_len, out_jpg, out_len);
-    uint8_t* b64_buf = (uint8_t*)ps_malloc(b64_len + 1);
-    if (b64_buf) {
-      mbedtls_base64_encode(b64_buf, b64_len + 1, &b64_len, out_jpg, out_len);
-      b64_buf[b64_len] = '\0';
-      String json = "{\"event\":\"menu_select\",\"item\":\"camera\",\"data\":\"";
-      json += (char*)b64_buf;
-      json += "\"}";
-      free(b64_buf);
-      webSocket.sendTXT(wsClientNum, json);
-    } else {
-      webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\",\"error\":\"no memory\"}");
-    }
-    free(out_jpg);
-    capturing = false;
-    micStartIfNeeded();
+  if (item == 0) {  // camera: イベントのみ送信（画像はHTTPで取得）
+    webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\"}");
 
   } else if (item == 2) {  // mic: マイク自動起動
     requestMicStart = true;
@@ -1962,10 +1923,22 @@ void loop() {
     if (millis() - lastMicSend > 30) {
       lastMicSend = millis();
       if (CoreS3.Mic.record(micBuffer, MIC_BUF, 16000)) {
+        // 無音検出: ピーク値が閾値を超えたら lastSoundTime を更新
+        for (int i = 0; i < MIC_BUF; i++) {
+          if (abs(micBuffer[i]) > SILENCE_THRESHOLD) {
+            lastSoundTime = millis();
+            break;
+          }
+        }
         webSocket.sendBIN(wsClientNum,
                           (uint8_t*)micBuffer,
                           MIC_BUF * sizeof(int16_t));
       }
+    }
+    // 一定時間無音ならマイクオフ
+    if (lastSoundTime > 0 && millis() - lastSoundTime > SILENCE_TIMEOUT_MS) {
+      lastSoundTime = 0;
+      requestMicStop = true;
     }
   }
 
