@@ -60,7 +60,9 @@ static unsigned long lastMicSend = 0;
 
 // ===================== 無音検出 =====================
 static unsigned long lastSoundTime = 0;
-static const unsigned long SILENCE_TIMEOUT_MS = 2000;
+static unsigned long micStartedAt = 0;
+static const unsigned long SILENCE_TIMEOUT_MS = 5000;   // 5秒無音でマイクオフ
+static const unsigned long MIC_MAX_DURATION_MS = 30000; // 最大録音時間30秒
 static const int SILENCE_THRESHOLD = 500;
 
 static constexpr const size_t record_number     = 256;
@@ -77,6 +79,8 @@ volatile bool receivingAudio = false;
 volatile bool requestMicStart = false;
 volatile bool requestMicStop = false;
 volatile bool requestAudioEnd = false;
+String statusLabel = "";
+unsigned long statusLabelUntil = 0;
 volatile bool requestPlaySound = false;
 volatile bool requestSleep = false;
 volatile bool requestWake = false;
@@ -221,6 +225,7 @@ void micStartIfNeeded() {
 
   CoreS3.Mic.begin();
   micActive = true;
+  micStartedAt = millis();
 
   // // フラッシュは軽く1回だけ
   // int16_t dummy[128];
@@ -233,6 +238,8 @@ void micStopIfNeeded() {
 
   CoreS3.Mic.end();
   micActive = false;
+  eyeTargetX = 0;
+  eyeTargetY = 0;
 
   Serial.println("[MIC] end");
 }
@@ -291,6 +298,10 @@ void sendMenuSelectEvent(int item) {
     json += names[item];
     json += "\"}";
     webSocket.sendTXT(wsClientNum, json);
+    if (item == 1) {
+      statusLabel = "SEN";
+      statusLabelUntil = millis() + 3000;
+    }
   }
 }
 
@@ -554,6 +565,27 @@ void drawIPIfNeededSprite() {
   }
 }
 
+void drawStatusLabelSprite() {
+  if (!wifiConnected) return;
+  String lbl = "";
+  if (capturing) {
+    lbl = "CAM";
+  } else if (micActive) {
+    lbl = "MIC";
+  } else if (statusLabel.length() > 0) {
+    if (millis() > statusLabelUntil) {
+      statusLabel = "";
+    } else {
+      lbl = statusLabel;
+    }
+  }
+  if (lbl.length() == 0) return;
+  faceSprite.setTextColor(TFT_DARKGREY, TFT_WHITE);
+  faceSprite.setTextSize(2);
+  faceSprite.setCursor(202, 2);
+  faceSprite.print(lbl);
+}
+
 void drawWifiStatusSprite() {
   const int x = 200;
   const int y = 0;
@@ -704,6 +736,7 @@ void drawFace(int eyeOffsetX, int eyeOffsetY, int mouthOpen) {
 
 
   drawWifiStatusSprite();
+  drawStatusLabelSprite();
   drawIPIfNeededSprite();
 
   faceSprite.pushSprite(0,0);
@@ -1839,10 +1872,12 @@ void loop() {
     requestMicStop = false;
     if (!speakerActive) {
       micStopIfNeeded();
+      webSocket.sendTXT(wsClientNum, "{\"event\":\"mic_end\"}");
     }
   }
 
   if (wsClientConnected && micActive && !capturing && !speakerActive) {
+    eyeTargetX = sin(millis() * 0.003) * 70;
     if (millis() - lastMicSend > 30) {
       lastMicSend = millis();
       if (CoreS3.Mic.record(micBuffer, MIC_BUF, 16000)) {
@@ -1858,6 +1893,10 @@ void loop() {
       }
     }
     if (lastSoundTime > 0 && millis() - lastSoundTime > SILENCE_TIMEOUT_MS) {
+      lastSoundTime = 0;
+      requestMicStop = true;
+    }
+    if (millis() - micStartedAt > MIC_MAX_DURATION_MS) {
       lastSoundTime = 0;
       requestMicStop = true;
     }

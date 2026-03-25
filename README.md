@@ -27,16 +27,9 @@ M5CoreS3 を使ったロボット顔デバイス。
 
 ---
 
-## 導入手順（PlatformIO）
+## 導入手順
 
-### 1. PlatformIO インストール
-
-```bash
-pip install platformio
-# または VS Code の PlatformIO IDE 拡張をインストール
-```
-
-### 2. WiFi設定
+### WiFi設定（共通）
 
 `m5_script/credentials.example.h` をコピーして `m5_script/credentials.h` を作成：
 
@@ -60,32 +53,76 @@ const char* pass3 = "パスワード";
 #define WG_SERVER_PORT        51820
 // キャラクターごとのWireGuard秘密鍵
 #define WG_PUCHIRU_PRIVATE_KEY  "..."
-...
 ```
 
 ssid1 に3回接続を試み、失敗したら ssid2、それも失敗したら ssid3 にフォールバック。切断時の再接続も同様。
 
 固定IPはソース内の `STATIC_IP_LAST` / `HOME_IP_LAST` / `ROUTER_IP_LAST` で各キャラクターのIPを設定。
 
-### 3. ビルド＆書き込み
+---
 
-2つの環境（`puchiko` / `puchiteya`）があり、それぞれ別の .ino をビルドする。
-`select_source.py` が `m5_script/m5_petit_<env>.ino` を自動で `src/` にコピーする。
+### 方法A: Arduino IDE（現在推奨）
+
+> ⚠️ PlatformIO はライブラリのバージョン依存問題により、現在ビルドが通っても動作にバグが出ることがあります。**Arduino IDE での書き込みを推奨**します。
+
+#### 1. ボード追加
+
+ファイル > 環境設定 > 追加のボードマネージャURL に追加：
+
+```
+https://static-cdn.m5stack.com/resource/arduino/package_m5stack_index.json
+```
+
+ツール > ボード > ボードマネージャ → `M5Stack` をインストール
+
+ボード設定：
+
+![ボード設定](img/image.png)
+
+#### 2. ライブラリインストール
+
+- M5CoreS3 (1.0.1)
+- M5Stack (0.4.6)
+- M5Unified (0.2.13)
+- SD (1.3.0)
+- [WebSockets by Links2004](https://github.com/Links2004/arduinoWebSockets)（ZIPダウンロードして追加）
+- [WireGuard-ESP32](https://github.com/ciniml/WireGuard-ESP32-Arduino)（ZIPダウンロードして追加。VPN不要の場合も必要）
+
+#### 3. 書き込み
+
+キャラクターごとの .ino を Arduino IDE で開いて書き込む：
+
+- `m5_script/m5_petit_puchiteya/m5_petit_puchiteya.ino`
+- `m5_script/m5_petit_puchiko/m5_petit_puchiko.ino`
+- `m5_script/m5_petit_puchiru/m5_petit_puchiru.ino`
+
+それぞれ対応する M5CoreS3 を USB 接続した状態で「マイコンボードに書き込む」を実行。
+
+---
+
+### 方法B: PlatformIO
 
 ```bash
-# ビルドのみ
-pio run -e puchiko
-pio run -e puchiteya
+pip install platformio
+# または VS Code の PlatformIO IDE 拡張をインストール
+```
 
+3つの環境（`puchiko` / `puchiteya` / `puchiru`）があり、それぞれ別の .ino をビルドする。
+`select_source.py` が `m5_script/m5_petit_<env>/m5_petit_<env>.ino` を自動で `src/` にコピーする。
+
+```bash
 # ビルド＆書き込み
 pio run -e puchiko -t upload
 pio run -e puchiteya -t upload
+pio run -e puchiru -t upload
 
 # シリアルモニタ
 pio device monitor
 ```
 
-> ⚠️ 2つの環境を同時にビルド（`pio run`）するとメモリ不足で落ちることがあります。1つずつビルドしてください。
+> ⚠️ 複数の環境を同時にビルド（`pio run`）するとメモリ不足で落ちることがあります。1つずつビルドしてください。
+
+ビルド済みの .ino は `~/petit_claude/characters/<キャラ名>/` にもコピーされています（バックアップ兼参照用）。
 
 ---
 
@@ -209,6 +246,14 @@ mDNS対応のため、IPアドレスの代わりにホスト名でもアクセ�
 
 バイナリ（int16, Mono, 16000Hz, 約30ms毎）
 
+#### 録音終了イベント
+
+無音タイムアウト（5秒）または最大録音時間（30秒）に達したとき、マイクを停止して送信：
+
+```json
+{ "event": "mic_end" }
+```
+
 ---
 
 ## 省電力モード
@@ -263,6 +308,27 @@ curl -F "file=@smile.jpg" http://<IP>/upload_face
 | VOLUME | 左タップ: 下げる / 右タップ: 上げる | 音量（5段階: 100/75/50/25/0%） |
 | PSAVE | タップ | 省電力モードON/OFFトグル |
 | `< BACK` | タップ | 設定画面を閉じる |
+
+## ステータス表示
+
+録音・撮影・センサー送信中は画面右上に状態テキストが表示される：
+
+| 表示 | 意味 |
+|------|------|
+| `CAM` | スナップショット取得中 |
+| `MIC` | マイク録音中（目が左右にゆれる） |
+| `SEN` | センサーデータ送信（3秒表示） |
+
+WiFi接続エラー時は `WiFi ERROR` が優先表示される。
+
+## マイク録音の停止条件
+
+以下のいずれかで自動停止し `mic_end` イベントを送信：
+
+- **無音5秒**（`SILENCE_TIMEOUT_MS`）: 最後に音を検知してから5秒経過
+- **最大30秒**（`MIC_MAX_DURATION_MS`）: うるさい環境でも必ず終了
+
+録音中は目が sin 波で左右にゆれ、停止時に正面に戻る。
 
 ## 注意事項
 
