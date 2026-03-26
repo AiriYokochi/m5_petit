@@ -1,3 +1,4 @@
+#include "config.h"
 #include "M5CoreS3.h"
 #include "esp_camera.h"
 
@@ -82,6 +83,9 @@ volatile bool requestAudioEnd = false;
 String statusLabel = "";
 unsigned long statusLabelUntil = 0;
 bool micLoopMode = false;
+const char* camUsers[] = CAM_USER_LIST;
+int camTargetIdx = 0;
+String camTarget = camUsers[0];
 volatile bool requestPlaySound = false;
 volatile bool requestSleep = false;
 volatile bool requestWake = false;
@@ -370,25 +374,26 @@ void handleStroke(int x, int y) {
 void handleSettingsTap(int x, int y) {
   if (y < 36) {
     // 時刻エリア：何もしない
-  } else if (y < 85) {
-    // 明るさ: 左半分=ダウン、右半分=アップ
+  } else if (y < 77) {
     if (x < 160) { if (brightnessIdx < BRIGHTNESS_STEP_COUNT - 1) brightnessIdx++; }
     else          { if (brightnessIdx > 0) brightnessIdx--; }
     currentBrightness = map(BRIGHTNESS_STEPS[brightnessIdx], 0, 100, 0, 255);
     CoreS3.Display.setBrightness(powerSaveMode ? min((uint8_t)40, currentBrightness) : currentBrightness);
-  } else if (y < 134) {
-    // 音量: 左半分=ダウン、右半分=アップ
+  } else if (y < 118) {
     if (x < 160) { if (volumeIdx < VOLUME_STEP_COUNT - 1) volumeIdx++; }
     else          { if (volumeIdx > 0) volumeIdx--; }
     currentVolumePercent = VOLUME_STEPS[volumeIdx];
     currentVolumeRaw     = map(currentVolumePercent, 0, 100, 0, 255);
     CoreS3.Speaker.setVolume(currentVolumeRaw);
-  } else if (y < 183) {
-    // 省電力トグル
+  } else if (y < 158) {
     powerSaveMode = !powerSaveMode;
     CoreS3.Display.setBrightness(powerSaveMode ? min((uint8_t)40, currentBrightness) : currentBrightness);
+  } else if (y < 198) {
+    camTargetIdx = (camTargetIdx + 1) % CAM_USER_COUNT;
+    camTarget = camUsers[camTargetIdx];
+    String json = "{\"event\":\"set_cam_target\",\"target\":\"" + camTarget + "\"}";
+    webSocket.sendTXT(wsClientNum, json);
   } else {
-    // 戻る
     settingsVisible = false;
     faceDirty       = true;
   }
@@ -420,36 +425,40 @@ void drawSettingsScreen() {
   }
   faceSprite.drawFastHLine(0, 35, 320, DIV);
 
-  // 明るさ (y:36-83)
-  faceSprite.fillRect(0, 36, 320, 48, ROW_A);
-  faceSprite.drawFastVLine(159, 36, 48, DIV);
-  faceSprite.setTextSize(1); faceSprite.setCursor(6, 46);  faceSprite.print("BRIGHTNESS");
-  faceSprite.setTextSize(2); faceSprite.setCursor(6, 62);
+  faceSprite.fillRect(0, 36, 320, 40, ROW_A);
+  faceSprite.drawFastVLine(159, 36, 40, DIV);
+  faceSprite.setTextSize(1); faceSprite.setCursor(6, 42);  faceSprite.print("BRIGHTNESS");
+  faceSprite.setTextSize(2); faceSprite.setCursor(6, 54);
   faceSprite.printf("%3d%%", BRIGHTNESS_STEPS[brightnessIdx]);
-  faceSprite.setCursor(70, 54);  faceSprite.print("<<");
-  faceSprite.setCursor(190, 54); faceSprite.print(">>");
-  faceSprite.drawFastHLine(0, 84, 320, DIV);
+  faceSprite.setCursor(70, 48);  faceSprite.print("<<");
+  faceSprite.setCursor(190, 48); faceSprite.print(">>");
+  faceSprite.drawFastHLine(0, 76, 320, DIV);
 
-  // 音量 (y:85-132)
-  faceSprite.fillRect(0, 85, 320, 48, ROW_B);
-  faceSprite.drawFastVLine(159, 85, 48, DIV);
-  faceSprite.setTextSize(1); faceSprite.setCursor(6, 95);  faceSprite.print("VOLUME");
-  faceSprite.setTextSize(2); faceSprite.setCursor(6, 111);
+  faceSprite.fillRect(0, 77, 320, 40, ROW_B);
+  faceSprite.drawFastVLine(159, 77, 40, DIV);
+  faceSprite.setTextSize(1); faceSprite.setCursor(6, 83);  faceSprite.print("VOLUME");
+  faceSprite.setTextSize(2); faceSprite.setCursor(6, 95);
   if (VOLUME_STEPS[volumeIdx] == 0) { faceSprite.print("MUTE"); }
   else { faceSprite.printf("%3d%%", VOLUME_STEPS[volumeIdx]); }
-  faceSprite.setCursor(70, 103);  faceSprite.print("<<");
-  faceSprite.setCursor(190, 103); faceSprite.print(">>");
-  faceSprite.drawFastHLine(0, 133, 320, DIV);
+  faceSprite.setCursor(70, 89);  faceSprite.print("<<");
+  faceSprite.setCursor(190, 89); faceSprite.print(">>");
+  faceSprite.drawFastHLine(0, 117, 320, DIV);
 
-  // 省電力 (y:134-181)
-  faceSprite.fillRect(0, 134, 320, 47, powerSaveMode ? PS_ON : PS_OFF);
-  faceSprite.setTextSize(2); faceSprite.setCursor(55, 151);
+  faceSprite.fillRect(0, 118, 320, 39, powerSaveMode ? PS_ON : PS_OFF);
+  faceSprite.setTextSize(2); faceSprite.setCursor(55, 132);
   faceSprite.print(powerSaveMode ? "PSAVE:  ON" : "PSAVE: OFF");
-  faceSprite.drawFastHLine(0, 181, 320, DIV);
+  faceSprite.drawFastHLine(0, 157, 320, DIV);
 
-  // 戻る (y:182-239)
-  faceSprite.fillRect(0, 182, 320, 58, BACK_C);
-  faceSprite.setTextSize(2); faceSprite.setCursor(105, 205);
+  const uint16_t CAM_A  = faceSprite.color565( 60,  45,  80);
+  const uint16_t CAM_B  = faceSprite.color565( 45,  60,  80);
+  faceSprite.fillRect(0, 158, 320, 39, camTargetIdx == 0 ? CAM_A : CAM_B);
+  faceSprite.setTextSize(1); faceSprite.setCursor(6, 164); faceSprite.print("CAM TO");
+  faceSprite.setTextSize(2); faceSprite.setCursor(6, 175);
+  faceSprite.print(camTarget);
+  faceSprite.drawFastHLine(0, 197, 320, DIV);
+
+  faceSprite.fillRect(0, 198, 320, 42, BACK_C);
+  faceSprite.setTextSize(2); faceSprite.setCursor(105, 215);
   faceSprite.print("< BACK");
 
   faceSprite.pushSprite(0, 0);
@@ -1729,7 +1738,7 @@ void setup() {
     }
 
     // NTP 時刻同期 (JST = UTC+9)
-    configTime(9 * 3600, 0, "pool.ntp.org", "ntp.nict.jp");
+    configTime(9 * 3600, 0, "192.168.1.1", "192.168.8.1");
     Serial.println("NTP configured");
   } else {
     ipString = "0.0.0.0";
@@ -1987,6 +1996,8 @@ void loop() {
       if (micLoopMode && wsClientConnected && !capturing) {
         requestMicStart = true;
         micStartDelayTime = millis();
+        pendingSoundName = "pon.wav";
+        requestPlaySound = true;
       }
   }
 
