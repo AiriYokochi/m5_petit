@@ -62,6 +62,8 @@ static unsigned long lastMicSend = 0;
 // ===================== 無音検出 =====================
 static unsigned long lastSoundTime = 0;
 static unsigned long micStartedAt = 0;
+static unsigned long micLoopWaitStartAt = 0;
+static const unsigned long MIC_LOOP_RESPONSE_TIMEOUT_MS = 60000;
 static const unsigned long SILENCE_TIMEOUT_MS = 5000;   // 5秒無音でマイクオフ
 static const unsigned long MIC_MAX_DURATION_MS = 30000; // 最大録音時間30秒
 static const int SILENCE_THRESHOLD = 500;
@@ -532,6 +534,11 @@ void playWavFromSD(const char* path) {
 
   CoreS3.Speaker.end();
   speakerActive = false;
+  if (micLoopMode && wsClientConnected && !capturing) {
+    micLoopWaitStartAt = 0;
+    requestMicStart = true;
+    micStartDelayTime = millis();
+  }
 }
 
 void handleSetVolume() {
@@ -1884,7 +1891,14 @@ void loop() {
     requestAudioEnd = false;
     CoreS3.Speaker.end();
     speakerActive = false;
+    micLoopWaitStartAt = 0;
     Serial.println("Playback finished");
+    if (micLoopMode && wsClientConnected && !capturing) {
+      requestMicStart = true;
+      micStartDelayTime = millis();
+      pendingSoundName = "pon.wav";
+      requestPlaySound = true;
+    }
   }
 
   if (requestMicStart &&
@@ -1899,6 +1913,7 @@ void loop() {
     if (!speakerActive) {
       micStopIfNeeded();
       webSocket.sendTXT(wsClientNum, "{\"event\":\"mic_end\"}");
+      if (micLoopMode) micLoopWaitStartAt = millis();
     }
   }
 
@@ -1957,6 +1972,7 @@ void loop() {
       millis() - lastAudioDataTime > 100) {
       CoreS3.Speaker.end();
       speakerActive = false;
+      micLoopWaitStartAt = 0;
       Serial.println("Playback finished");
       if (micLoopMode && wsClientConnected && !capturing) {
         requestMicStart = true;
@@ -1964,6 +1980,15 @@ void loop() {
         pendingSoundName = "pon.wav";
         requestPlaySound = true;
       }
+  }
+
+  if (micLoopMode && wsClientConnected && !micActive && !speakerActive &&
+      micLoopWaitStartAt > 0 &&
+      millis() - micLoopWaitStartAt > MIC_LOOP_RESPONSE_TIMEOUT_MS) {
+    Serial.println("[MIC LOOP] response timeout, restarting");
+    micLoopWaitStartAt = 0;
+    requestMicStart = true;
+    micStartDelayTime = millis();
   }
 
 }
