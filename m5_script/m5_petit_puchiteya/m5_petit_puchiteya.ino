@@ -625,7 +625,9 @@ void drawStatusLabelSprite() {
   if (capturing) {
     lbl = "CAM";
   } else if (micActive) {
-    lbl = "MIC";
+    lbl = micLoopMode ? "MIC LOOP" : "MIC";
+  } else if (micLoopMode) {
+    lbl = "LOOP";
   } else if (statusLabel.length() > 0) {
     if (millis() > statusLabelUntil) {
       statusLabel = "";
@@ -638,6 +640,11 @@ void drawStatusLabelSprite() {
   faceSprite.setTextSize(2);
   faceSprite.setCursor(202, 2);
   faceSprite.print(lbl);
+  if (micLoopMode && !micActive) {
+    faceSprite.setTextSize(1);
+    faceSprite.setCursor(190, 22);
+    faceSprite.print("tap:cancel");
+  }
 }
 
 void drawFace(int eyeOffsetX, int eyeOffsetY, int mouthOpen) {
