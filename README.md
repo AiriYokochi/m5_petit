@@ -316,7 +316,10 @@ curl -F "file=@smile.jpg" http://<IP>/upload_face
 | BRIGHTNESS | 左タップ: 下げる / 右タップ: 上げる | 画面輝度（5段階: 100/75/50/5/0%） |
 | VOLUME | 左タップ: 下げる / 右タップ: 上げる | 音量（5段階: 100/75/50/25/0%） |
 | PSAVE | タップ | 省電力モードON/OFFトグル |
+| CAM TO | タップ | みてみて・きいて・かんじてのメール送信先を順番に切り替え |
 | `< BACK` | タップ | 設定画面を閉じる |
+
+CAM TO の順番とデフォルト値は `config.h` で設定する（後述）。
 
 ## ステータス表示
 
@@ -326,9 +329,13 @@ curl -F "file=@smile.jpg" http://<IP>/upload_face
 |------|------|
 | `CAM` | スナップショット取得中 |
 | `MIC` | マイク録音中（目が左右にゆれる） |
+| `MIC LOOP` | 往復モード録音中 |
+| `LOOP` | 往復モード待機中（次の録音を待っている） |
 | `SEN` | センサーデータ送信（3秒表示） |
 
 WiFi接続エラー時は `WiFi ERROR` が優先表示される。
+
+往復モード（`LOOP`）は待機中に画面右下に `tap:cancel` も表示される。待機中にタップすると往復モードを解除できる。
 
 ## マイク録音の停止条件
 
@@ -339,6 +346,37 @@ WiFi接続エラー時は `WiFi ERROR` が優先表示される。
 - **顔タップ**: 録音中に顔画面をタップすると即停止（往復モードも解除）
 
 録音中は目が sin 波で左右にゆれ、停止時に正面に戻る。
+
+## ユーザー設定（config.h）
+
+各キャラクターのフォルダに `config.h` を置くことで、ファームウェアを再コンパイルせずに設定を変更できる（実際はコンパイル時に読み込まれる）。
+
+```
+m5_script/
+├── m5_petit_puchiteya/
+│   ├── m5_petit_puchiteya.ino
+│   └── config.h   ← ここに書く
+├── m5_petit_puchiko/
+│   └── config.h
+└── m5_petit_puchiru/
+    └── config.h
+```
+
+`config.h` の例：
+
+```cpp
+#pragma once
+
+// ユーザー名定義
+#define USER_ARISAN   "arisan"
+#define USER_KAZAHAYA "kazahaya"
+
+// CAM送信先リスト（[0]がデフォルト、増やすときはここに追加してCAM_USER_COUNTも変える）
+#define CAM_USER_LIST  { USER_ARISAN, USER_KAZAHAYA }
+#define CAM_USER_COUNT 2
+```
+
+3人目を追加したい場合は `USER_XXX` を定義して `CAM_USER_LIST` と `CAM_USER_COUNT` を更新するだけ。設定画面の CAM TO はリストを順番に切り替える。
 
 ## 注意事項
 
