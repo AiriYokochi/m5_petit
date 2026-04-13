@@ -24,6 +24,7 @@ WebSocketsServer webSocket(8080);
 // ===================== UI / State =====================
 unsigned long bootTime = 0;
 bool showIP = true;
+unsigned long showIPStartTime = 0;
 String ipString;
 bool cameraAvailable = true;
 
@@ -150,6 +151,7 @@ unsigned long winkEndTime = 0;
 bool isSleeping = false;
 int touchCount = 0;
 unsigned long lastTouchTime = 0;
+unsigned long lastTouchEventTime = 0;  // 起動からのms（タップ・なでで更新）
 unsigned long sleepStartTime = 0;
 
 // ===== タッチメニュー =====
@@ -164,6 +166,7 @@ const unsigned long MENU_TIMEOUT_MS = 5000;
 
 // ===== 設定メニュー =====
 bool settingsVisible = false;
+unsigned long settingsShowTime = 0;
 const int BRIGHTNESS_STEPS[]    = {100, 75, 50, 5, 0};
 const int VOLUME_STEPS[]        = {100, 75, 50, 25, 0};
 const int BRIGHTNESS_STEP_COUNT = 5;
@@ -307,6 +310,8 @@ void sendMenuSelectEvent(int item) {
 
   if (item == 0) {  // camera: イベントのみ送信（画像はHTTPで取得）
     webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"camera\"}");
+    statusLabel = "CAM";
+    statusLabelUntil = millis() + 3000;
 
   } else if (item == 2) {  // mic: マイク自動起動（1回モード）
     micLoopMode = false;
@@ -334,9 +339,13 @@ void handleTap(int x, int y) {
   if (menuVisible) {
     int item = menuItemAt(x, y);
     if (item == 3) {  // settings
-      menuVisible     = false;
-      settingsVisible = true;
-      faceDirty       = true;
+      menuVisible      = false;
+      settingsVisible  = true;
+      faceDirty        = true;
+      settingsShowTime = millis();
+      // 実機の明るさ・音量をidxに反映
+      { int p = map(currentBrightness, 0, 255, 0, 100); int bd=999; for(int i=0;i<BRIGHTNESS_STEP_COUNT;i++){int d=abs(BRIGHTNESS_STEPS[i]-p);if(d<bd){bd=d;brightnessIdx=i;}} }
+      { int bd=999; for(int i=0;i<VOLUME_STEP_COUNT;i++){int d=abs(VOLUME_STEPS[i]-currentVolumePercent);if(d<bd){bd=d;volumeIdx=i;}} }
     } else {
       sendMenuSelectEvent(item);
       menuVisible = false;
@@ -350,6 +359,7 @@ void handleTap(int x, int y) {
     menuShowTime  = millis();
     faceDirty     = true;
   }
+  lastTouchEventTime = millis();
   sendTouchEvent(x, y);
 }
 
@@ -363,6 +373,7 @@ void handleStroke(int x, int y) {
       requestMicStart = true;
       micStartDelayTime = millis();
       webSocket.sendTXT(wsClientNum, "{\"event\":\"menu_select\",\"item\":\"mic\"}");
+      lastTouchEventTime = millis();
       sendTouchEvent(x, y);
       return;
     }
@@ -370,10 +381,12 @@ void handleStroke(int x, int y) {
     faceDirty = true;
   }
   if (settingsVisible) { settingsVisible = false;  faceDirty = true; }
+  lastTouchEventTime = millis();
   sendTouchEvent(x, y);
 }
 
 void handleSettingsTap(int x, int y) {
+  settingsShowTime = millis();  // タップのたびにタイムアウトリセット
   if (y < 36) {
     // 時刻エリア：何もしない
   } else if (y < 77) {
@@ -387,14 +400,16 @@ void handleSettingsTap(int x, int y) {
     currentVolumePercent = VOLUME_STEPS[volumeIdx];
     currentVolumeRaw     = map(currentVolumePercent, 0, 100, 0, 255);
     CoreS3.Speaker.setVolume(currentVolumeRaw);
-  } else if (y < 158) {
-    powerSaveMode = !powerSaveMode;
-    CoreS3.Display.setBrightness(powerSaveMode ? min((uint8_t)40, currentBrightness) : currentBrightness);
   } else if (y < 198) {
-    camTargetIdx = (camTargetIdx + 1) % CAM_USER_COUNT;
-    camTarget = camUsers[camTargetIdx];
-    String json = "{\"event\":\"set_cam_target\",\"target\":\"" + camTarget + "\"}";
-    webSocket.sendTXT(wsClientNum, json);
+    if (x < 160) {  // PSAVE
+      powerSaveMode = !powerSaveMode;
+      CoreS3.Display.setBrightness(powerSaveMode ? min((uint8_t)40, currentBrightness) : currentBrightness);
+    } else {        // CAM TO
+      camTargetIdx = (camTargetIdx + 1) % CAM_USER_COUNT;
+      camTarget = camUsers[camTargetIdx];
+      String json = "{\"event\":\"set_cam_target\",\"target\":\"" + camTarget + "\"}";
+      webSocket.sendTXT(wsClientNum, json);
+    }
   } else {
     settingsVisible = false;
     faceDirty       = true;
@@ -446,17 +461,16 @@ void drawSettingsScreen() {
   faceSprite.setCursor(190, 89); faceSprite.print(">>");
   faceSprite.drawFastHLine(0, 117, 320, DIV);
 
-  faceSprite.fillRect(0, 118, 320, 39, powerSaveMode ? PS_ON : PS_OFF);
-  faceSprite.setTextSize(2); faceSprite.setCursor(55, 132);
-  faceSprite.print(powerSaveMode ? "PSAVE:  ON" : "PSAVE: OFF");
-  faceSprite.drawFastHLine(0, 157, 320, DIV);
-
+  // PSAVE (左) / CAM TO (右) — 縦割り
   const uint16_t CAM_A  = faceSprite.color565( 60,  45,  80);
   const uint16_t CAM_B  = faceSprite.color565( 45,  60,  80);
-  faceSprite.fillRect(0, 158, 320, 39, camTargetIdx == 0 ? CAM_A : CAM_B);
-  faceSprite.setTextSize(1); faceSprite.setCursor(6, 164); faceSprite.print("CAM TO");
-  faceSprite.setTextSize(2); faceSprite.setCursor(6, 175);
-  faceSprite.print(camTarget);
+  faceSprite.fillRect(  0, 118, 160, 79, powerSaveMode ? PS_ON : PS_OFF);
+  faceSprite.fillRect(160, 118, 160, 79, camTargetIdx == 0 ? CAM_A : CAM_B);
+  faceSprite.setTextSize(1); faceSprite.setCursor(  6, 124); faceSprite.print("PSAVE");
+  faceSprite.setTextSize(2); faceSprite.setCursor(  6, 148); faceSprite.print(powerSaveMode ? " ON" : "OFF");
+  faceSprite.setTextSize(1); faceSprite.setCursor(166, 124); faceSprite.print("CAM TO");
+  faceSprite.setTextSize(2); faceSprite.setCursor(166, 148); faceSprite.print(camTarget);
+  faceSprite.drawFastVLine(159, 118, 79, DIV);
   faceSprite.drawFastHLine(0, 197, 320, DIV);
 
   faceSprite.fillRect(0, 198, 320, 42, BACK_C);
@@ -531,6 +545,7 @@ void playWavFromSD(const char* path) {
 
   CoreS3.Speaker.begin();
   CoreS3.Speaker.setVolume(currentVolumeRaw);
+  CoreS3.update();  // I2S設定を確定させる
 
   File wav = SD.open(path);
   if (!wav) {
@@ -561,11 +576,21 @@ void playWavFromSD(const char* path) {
 
   CoreS3.Speaker.playWav(buffer, size);
 
-  free(buffer);
-
-  while (CoreS3.Speaker.isPlaying()) {
+  // 再生開始を待つ（update()を呼ばないとisPlaying()がtrueにならない）
+  for (int i = 0; i < 200 && !CoreS3.Speaker.isPlaying(); i++) {
+    CoreS3.update();
     delay(1);
   }
+
+  // 再生完了を待つ。HTTP/WSも処理してブロッキングによるタイムアウトを防ぐ
+  while (CoreS3.Speaker.isPlaying()) {
+    CoreS3.update();
+    server.handleClient();
+    webSocket.loop();
+    delay(1);
+  }
+
+  free(buffer);
 
   CoreS3.Speaker.end();
   speakerActive = false;
@@ -624,7 +649,7 @@ void drawIPIfNeededSprite() {
 
   if (!showIP) return;
 
-  if (millis() - bootTime < 30000) {
+  if (millis() - showIPStartTime < 30000) {
 
     faceSprite.fillRect(0, 220, 320, 20, TFT_WHITE);
     faceSprite.setTextSize(1);
@@ -982,9 +1007,9 @@ void handleSePlay() {
     return;
   }
   String name = server.arg("name");
-  String path = "/wav/" + name;
-
-  playWavFromSD(path.c_str());
+  // メインループで非同期再生（ブロッキング回避）
+  pendingSoundName  = name;
+  requestPlaySound  = true;
   server.send(200, "text/plain", "ok");
 }
 
@@ -1040,6 +1065,7 @@ void updateWifiState() {
       Serial.println("WiFi reconnected");
       ipString = WiFi.localIP().toString();
       showIP = true;
+      showIPStartTime = millis();
       reconnectAttempt = 0;
       // mDNS再起動
       MDNS.end();
@@ -1056,7 +1082,7 @@ void updateWifiState() {
     drawWifiStatus();
   }
 
-  if (!wifiConnected && (millis() - lastReconnectTry > 5000)) {
+  if (!wifiConnected && (millis() - lastReconnectTry > 1000)) {
     lastReconnectTry = millis();
     reconnectAttempt++;
     WiFi.disconnect();
@@ -1107,7 +1133,7 @@ void drawWifiStatus() {
 void drawIPIfNeeded() {
   if (!showIP) return;
 
-  if (millis() - bootTime < 30000) {
+  if (millis() - showIPStartTime < 30000) {
     // 右下を白で上書き（黒帯にしない）
     CoreS3.Display.fillRect(0, 220, 320, 20, TFT_WHITE);
     CoreS3.Display.setTextSize(1);
@@ -1322,7 +1348,7 @@ void sendSensorPacket() {
   json += "\"battery\":" + String(battery,1) + ",";
   json += "\"voltage\":" + String(voltage,3) + ",";
   json += "\"rssi\":" + String(rssi) + ",";
-  json += "\"lastTouchEventTime\":" + String(lastTouchTime);
+  json += "\"lastTouchEventTime\":" + String(lastTouchEventTime);
   json += "}";
 
   webSocket.sendTXT(wsClientNum, json);
@@ -1394,7 +1420,7 @@ void handleGetSensors() {
   json += "\"battery\":" + String(battery,1) + ",";
   json += "\"voltage\":" + String(voltage,3) + ",";
   json += "\"rssi\":" + String(rssi) + ",";
-  json += "\"lastTouchEventTime\":" + String(lastTouchTime);
+  json += "\"lastTouchEventTime\":" + String(lastTouchEventTime);
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -1799,6 +1825,7 @@ void setup() {
 
   bootTime = millis();
   showIP = true;
+  showIPStartTime = millis();
 
 
   
@@ -1869,6 +1896,12 @@ void loop() {
     eyeTargetX = 0;
     eyeTargetY = 0;
     eyeAutoReturn = false;
+  }
+
+  // 設定画面：1分無操作で自動閉じ
+  if (settingsVisible && millis() - settingsShowTime > 60000) {
+    settingsVisible = false;
+    faceDirty = true;
   }
 
   if (currentFaceMode == FACE_DRAW) {
@@ -1943,13 +1976,11 @@ void loop() {
           micStartIfNeeded();
       }
   }
-  if (requestMicStop) {
+  if (requestMicStop && !speakerActive) {
     requestMicStop = false;
-    if (!speakerActive) {
-      micStopIfNeeded();
-      webSocket.sendTXT(wsClientNum, "{\"event\":\"mic_end\"}");
-      if (micLoopMode) micLoopWaitStartAt = millis();
-    }
+    micStopIfNeeded();
+    webSocket.sendTXT(wsClientNum, "{\"event\":\"mic_end\"}");
+    if (micLoopMode) micLoopWaitStartAt = millis();
   }
 
   if (wsClientConnected && micActive && !capturing && !speakerActive) {
